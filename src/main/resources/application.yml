@@ -1,54 +1,137 @@
+# ============================================================================
+# 服务器配置
+# ============================================================================
 server:
+  # 服务监听端口，K8s 环境中通常通过环境变量 SERVER_PORT 覆盖
   port: 8080
+  # 启用优雅停机：收到 SIGTERM 后等待现有请求处理完成
+  # 避免在请求处理过程中突然中断导致数据不一致
   shutdown: graceful
 
+# ============================================================================
+# Spring 框架配置
+# ============================================================================
 spring:
   lifecycle:
+    # 优雅停机超时时间：最多等待 30 秒让现有请求完成
+    # 超时后强制关闭，防止僵尸进程
     timeout-per-shutdown-phase: 30s
+
+  # ---------------------------------------------------------------------------
+  # 数据源配置（用于请求日志持久化）
+  # ---------------------------------------------------------------------------
   datasource:
+    # MySQL 连接地址，生产环境通过环境变量 MYSQL_HOST/MYSQL_PORT/MYSQL_DATABASE 覆盖
     url: jdbc:mysql://localhost:3306/ccg
+    # 数据库用户名，生产环境通过环境变量 MYSQL_USER 覆盖
     username: ccguser
+    # 数据库密码，生产环境通过环境变量 MYSQL_PASSWORD 覆盖
     password: ccguser
+    # HikariCP 连接池配置
     hikari:
+      # 最大连接数：根据数据库服务器规格和并发需求调整
+      # 过大会占用过多数据库连接资源
       maximum-pool-size: 5
+      # 最小空闲连接数：保持一定数量的空闲连接以快速响应请求
+      # 避免频繁创建/销毁连接的性能开销
       minimum-idle: 1
+
+  # ---------------------------------------------------------------------------
+  # Flyway 数据库迁移配置
+  # ---------------------------------------------------------------------------
   flyway:
+    # 启用 Flyway 自动迁移：应用启动时自动执行迁移脚本
     enabled: true
+    # 迁移脚本位置：放在 resources/db/migration 目录下
+    # 文件命名格式：V{版本号}__{描述}.sql，如 V001__init_schema.sql
     locations: classpath:db/migration
 
+# ============================================================================
+# AWS Bedrock 模型代理配置
+# ============================================================================
 bedrock:
+  # AWS 区域：Bedrock 服务所在的 AWS 区域
+  # 不同区域的模型可用性可能不同
   region: ${BEDROCK_REGION:us-east-1}
-  access-key: ${BEDROCK_ACCESS_KEY:ASIA6AUHPDRELVQCG3AT}
-  secret-key: ${BEDROCK_SECRET_KEY:A5Zi2WKsqsLAC8JEnuK3TGtZpv1iIRMVxO5Ynqk1}
+  # AWS 访问密钥：用于认证 Bedrock API 调用
+  # 必须通过环境变量 BEDROCK_ACCESS_KEY 注入，不可硬编码
+  access-key: ${BEDROCK_ACCESS_KEY:}
+  # AWS 密钥：与 access-key 配合使用
+  # 必须通过环境变量 BEDROCK_SECRET_KEY 注入，不可硬编码
+  secret-key: ${BEDROCK_SECRET_KEY:}
+  # AWS 会话令牌：临时凭证时使用，长期凭证可留空
+  # 必须通过环境变量 BEDROCK_SESSION_TOKEN 注入
+  session-token: ${BEDROCK_SESSION_TOKEN:}
+  # 响应格式转换策略：
+  # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
+  # - passthrough: 直接透传 Bedrock 原始响应，不做转换
+  response-format: ${BEDROCK_RESPONSE_FORMAT:anthropic}
+  # 最大重试次数：Bedrock API 调用失败时的最大重试次数
+  # 用于处理临时性网络故障或服务端错误
   retry-max: 3
-  timeout-seconds: 120
+  # 请求超时时间：等待 Bedrock 响应的最大时间（秒）
+  # 流式请求的整个生命周期不应超过此值
+  timeout-seconds: 300
+
+  # ---------------------------------------------------------------------------
+  # 工具调用追踪配置（仅用于调试）
+  # ---------------------------------------------------------------------------
+  # 是否启用工具调用追踪日志
+  # 开启后 logger「com.padb.ccg.proxy.ToolCallTrace」会输出：
+  #   REQUEST_OUT（请求发出）、RAW chunk（原始数据块）、
+  #   UPSTREAM_SSE（上游 SSE 事件）、STREAM_DONE（流结束）等
+  # 注意：会输出大量日志，仅用于排查工具调用问题，勿长期开启
+  tool-call-trace-enabled: ${BEDROCK_TOOL_CALL_TRACE:true}
+  # 追踪日志最大字符数：超过此长度的日志会被截断，避免日志过大
+  tool-call-trace-max-chars: 6000
+
+  # ---------------------------------------------------------------------------
+  # 模型映射配置：将请求中的模型名称映射到 Bedrock 模型
+  # ---------------------------------------------------------------------------
   model-mappings:
+    # 映射配置 ID：用于标识此映射配置
     - id: mapping-001
-      model-name: claude-opus-4-7
+      # 对外暴露的模型名称：客户端请求时使用的模型名称
+      model-name: glm-5
+      # Bedrock 模型 ID：实际调用 Bedrock 时使用的模型标识
       bedrock-model-id: zai.glm-5
+      # 模型所在区域：可覆盖全局 region 配置
       region: us-east-1
+      # 模型能力列表：声明该模型支持的功能
       capabilities:
-        - text
-        - vision
-    - id: mapping-002
-      model-name: claude-sonnet-4-6
-      bedrock-model-id: zai.glm-5
-      region: us-east-1
-      capabilities:
-        - text
-        - vision
+        - text      # 支持 文本生成
+        - vision    # 支持 图像理解（多模态）
+        - tools     # 支持 工具调用（Function Calling）
+        - stream    # 支持 流式输出（SSE）
+
     - id: mapping-003
-      model-name: claude-haiku-4-5
+      model-name: deepseek
       bedrock-model-id: deepseek.v3.2
       region: us-east-1
       capabilities:
-        - text
+        - text      # 仅支持文本生成
 
+# ============================================================================
+# 认证配置
+# ============================================================================
 auth:
+  # 认证平台 URL：调用外部认证服务验证 API Key
+  # 生产环境通过环境变量 AUTH_PLATFORM_URL 注入
   platform-url: ${AUTH_PLATFORM_URL:http://localhost:8081/api/auth}
+  # 认证请求超时时间：等待认证平台响应的最大时间（秒）
+  # 超时后默认拒绝请求，保护服务可用性
   platform-timeout-seconds: 5
+  # 认证结果缓存时间：减少对认证平台的重复请求（秒）
+  # 设置为 28800 秒（8 小时），与 API Key 有效期对齐
   cache-ttl-seconds: 28800
-  mock-enabled: true  # 本地开发跳过认证，所有请求直接放行
+  # 是否启用 Mock 模式：true 时跳过认证，所有请求直接放行
+  # 仅用于本地开发和测试，生产环境必须设为 false
+  mock-enabled: true
 
+# ============================================================================
+# 限流配置
+# ============================================================================
 rate-limit:
+  # 默认每分钟请求数限制：防止 API 滥用，保护后端服务
+  # 超过限制的请求返回 429 Too Many Requests
   default-rpm: 60

@@ -15,13 +15,15 @@ class ProviderRegistryImplTest {
 
     @BeforeEach
     void setUp() {
-        var props = new BedrockProperties("us-east-1", null, null, 3, 120,
+        var props = new BedrockProperties("us-east-1", null, null, null, 3, 120,
                 List.of(
                         new ProviderConfig("m-1", "claude-opus-4-7", "us.anthropic.claude-opus-4-7-v1:0",
                                 "us-west-2", List.of("text")),
                         new ProviderConfig("m-2", "claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6-v1:0",
                                 "us-east-1", List.of("text", "vision"))
-                ));
+                ),
+                "passthrough",
+                false, 4096);
         registry = new ProviderRegistryImpl(props);
         registry.init();
     }

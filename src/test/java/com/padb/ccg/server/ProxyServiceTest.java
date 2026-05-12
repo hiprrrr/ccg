@@ -17,7 +17,9 @@ import reactor.core.publisher.Mono;
 
 import java.util.Optional;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 @WebFluxTest
@@ -97,6 +99,25 @@ class ProxyServiceTest {
                 .bodyValue("{\"model\":\"claude-opus-4-7\"}")
                 .exchange()
                 .expectStatus().isForbidden();
+    }
+
+    @Test
+    void shouldAcceptBearerTokenAsUsername() {
+        var mapping = new ProviderConfig("m-1", "claude-opus-4-7",
+                "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
+        when(providerRegistry.resolve("claude-opus-4-7")).thenReturn(Optional.of(mapping));
+        when(authService.authorize("user1", "claude-opus-4-7")).thenReturn(Mono.empty());
+        when(rateLimiter.tryAcquire("user1")).thenReturn(Mono.just(true));
+        when(bedrockHandler.forward(eq(mapping), anyString(), any(), any(), eq("user1"), eq("claude-opus-4-7"), anyString()))
+                .thenReturn(reactor.core.publisher.Flux.empty());
+
+        webClient.post()
+                .uri("/v1/messages")
+                .header("Authorization", "Bearer user1")
+                .header("Content-Type", "application/json")
+                .bodyValue("{\"model\":\"claude-opus-4-7\"}")
+                .exchange()
+                .expectStatus().isOk();
     }
 
     @Test

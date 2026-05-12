@@ -41,6 +41,12 @@
             <artifactId>bedrockruntime</artifactId>
             <version>${aws.sdk.version}</version>
         </dependency>
+        <!-- 显式引入：BedrockRuntimeAsyncClient 自定义 Netty 读超时需编译期可见 software.amazon.awssdk.http.nio.netty -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>netty-nio-client</artifactId>
+            <version>${aws.sdk.version}</version>
+        </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>auth</artifactId>

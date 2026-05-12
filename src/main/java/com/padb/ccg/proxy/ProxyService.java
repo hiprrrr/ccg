@@ -22,12 +22,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 代理服务，编排完整的请求代理流程：
- * 1. 提取用户身份（x-api-key）和请求模型
+ * 1. 提取用户身份（x-api-key 或 Authorization: Bearer）和请求模型
  * 2. 认证授权
  * 3. 限流检查
  * 4. 转发到 Bedrock（SSE 流式）
@@ -37,6 +38,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ProxyService {
 
     private static final Logger log = LoggerFactory.getLogger(ProxyService.class);
+    private static final Duration SSE_HEARTBEAT_INTERVAL = Duration.ofSeconds(15);
 
     private final AuthService authService;
     private final RateLimiter rateLimiter;
@@ -65,11 +67,12 @@ public class ProxyService {
      */
     public Mono<ServerResponse> process(ServerRequest request) {
         Instant start = Instant.now();
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
 
-        // 从请求头提取用户身份
-        String username = request.headers().firstHeader("x-api-key");
+        // 从请求头提取用户身份：优先兼容 Anthropic 的 x-api-key，回退到 Claude Code 常用的 Bearer token
+        String username = extractUsername(request);
         if (username == null || username.isBlank()) {
-            return respondError(403, "permission_error", "Missing x-api-key header");
+            return respondError(403, "permission_error", "Missing x-api-key or Authorization Bearer token");
         }
 
         return request.bodyToMono(String.class)
@@ -79,6 +82,9 @@ public class ProxyService {
                     if (model == null) {
                         return respondError(400, "invalid_request_error", "Missing model in request body");
                     }
+                    log.info("Gateway request accepted: id={} user={} model={} bodyChars={} toolUse={} toolResult={} tools={}",
+                            requestId, username, model, body.length(),
+                            body.contains("\"tool_use\""), body.contains("\"tool_result\""), body.contains("\"tools\""));
 
                     // 查找 Bedrock 模型映射
                     var mappingOpt = providerRegistry.resolve(model);
@@ -98,8 +104,17 @@ public class ProxyService {
                             .then(Mono.defer(() -> rateLimiter.tryAcquire(username)))
                             .flatMap(ok -> {
                                 // 构建 SSE 流，附加错误捕获和日志记录
-                                Flux<ServerSentEvent<String>> sseFlux = bedrockHandler
-                                        .forward(mapping, body, inputTokens, outputTokens, username, model)
+                                Flux<ServerSentEvent<String>> bedrockFlux = bedrockHandler
+                                        .forward(mapping, body, inputTokens, outputTokens, username, model, requestId);
+                                Flux<ServerSentEvent<String>> heartbeatFlux = Flux
+                                        .interval(SSE_HEARTBEAT_INTERVAL)
+                                        // SSE 注释帧不会进入 Anthropic 事件流，但能保持连接活跃
+                                        .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
+                                Flux<ServerSentEvent<String>> sseFlux = bedrockFlux
+                                        .publish(shared -> Flux.merge(
+                                                shared,
+                                                heartbeatFlux.takeUntilOther(shared.ignoreElements())
+                                        ))
                                         .doOnError(e -> {
                                             // 记录错误信息用于最终日志
                                             String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -109,12 +124,26 @@ public class ProxyService {
                                             // 流结束时记录请求日志（fire-and-forget）
                                             switch (signal) {
                                                 case ON_COMPLETE:
+                                                    log.info("SSE response completed: id={} user={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, username, model,
+                                                            Duration.between(start, Instant.now()).toMillis(),
+                                                            inputTokens.get(), outputTokens.get());
                                                     logRequest(username, model, mapping.bedrockModelId(),
                                                             true, null, inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case ON_ERROR:
+                                                    log.warn("SSE response errored: id={} user={} model={} durationMs={} error={}",
+                                                            requestId, username, model,
+                                                            Duration.between(start, Instant.now()).toMillis(),
+                                                            errorRef.get());
                                                     logRequest(username, model, mapping.bedrockModelId(),
                                                             false, errorRef.get(), inputTokens.get(), outputTokens.get(), start);
+                                                    break;
+                                                case CANCEL:
+                                                    log.info("SSE response cancelled: id={} user={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, username, model,
+                                                            Duration.between(start, Instant.now()).toMillis(),
+                                                            inputTokens.get(), outputTokens.get());
                                                     break;
                                                 default:
                                                     break;
@@ -127,6 +156,27 @@ public class ProxyService {
                             });
                 })
                 .onErrorResume(e -> handleError(e));
+    }
+
+    /**
+     * 从请求头提取用户名。Claude Code 使用 {@code ANTHROPIC_AUTH_TOKEN} 时会发送
+     * {@code Authorization: Bearer <token>}，这里将 token 作为网关用户名处理。
+     */
+    private String extractUsername(ServerRequest request) {
+        String apiKey = request.headers().firstHeader("x-api-key");
+        if (apiKey != null && !apiKey.isBlank()) {
+            return apiKey.trim();
+        }
+        String authorization = request.headers().firstHeader("Authorization");
+        if (authorization == null || authorization.isBlank()) {
+            return null;
+        }
+        String bearerPrefix = "Bearer ";
+        if (authorization.regionMatches(true, 0, bearerPrefix, 0, bearerPrefix.length())) {
+            String token = authorization.substring(bearerPrefix.length()).trim();
+            return token.isBlank() ? null : token;
+        }
+        return null;
     }
 
     /**
