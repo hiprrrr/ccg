@@ -1,0 +1,9 @@
+apollo:
+  bootstrap:
+    enabled: false
+    namespaces: application
+  meta: ${APOLLO_META:http://apollo-configservice:8080}
+  cluster: default
+
+app:
+  id: ccgeteway

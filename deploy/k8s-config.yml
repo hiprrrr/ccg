@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ccgeteway-config
+data:
+  apollo.meta: "http://apollo-configservice:8080"
+  mysql.host: "mysql"
+  bedrock.region: "us-east-1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ccgeteway-secret
+type: Opaque
+stringData:
+  mysql.user: "ccgeteway"
+  mysql.pass: ""
+  bedrock.access_key: ""
+  bedrock.secret_key: ""

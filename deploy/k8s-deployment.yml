@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ccgeteway
+  labels:
+    app: ccgeteway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ccgeteway
+  template:
+    metadata:
+      labels:
+        app: ccgeteway
+    spec:
+      terminationGracePeriodSeconds: 35
+      containers:
+        - name: ccgeteway
+          image: ccgeteway:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APOLLO_META
+              valueFrom:
+                configMapKeyRef:
+                  name: ccgeteway-config
+                  key: apollo.meta
+            - name: MYSQL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: ccgeteway-config
+                  key: mysql.host
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ccgeteway-secret
+                  key: mysql.user
+            - name: MYSQL_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: ccgeteway-secret
+                  key: mysql.pass
+            - name: BEDROCK_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ccgeteway-secret
+                  key: bedrock.access_key
+            - name: BEDROCK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ccgeteway-secret
+                  key: bedrock.secret_key
+            - name: BEDROCK_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: ccgeteway-config
+                  key: bedrock.region
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5

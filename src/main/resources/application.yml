@@ -1,0 +1,54 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  datasource:
+    url: jdbc:mysql://localhost:3306/ccg
+    username: ccguser
+    password: ccguser
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 1
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+bedrock:
+  region: ${BEDROCK_REGION:us-east-1}
+  access-key: ${BEDROCK_ACCESS_KEY:ASIA6AUHPDRELVQCG3AT}
+  secret-key: ${BEDROCK_SECRET_KEY:A5Zi2WKsqsLAC8JEnuK3TGtZpv1iIRMVxO5Ynqk1}
+  retry-max: 3
+  timeout-seconds: 120
+  model-mappings:
+    - id: mapping-001
+      model-name: claude-opus-4-7
+      bedrock-model-id: zai.glm-5
+      region: us-east-1
+      capabilities:
+        - text
+        - vision
+    - id: mapping-002
+      model-name: claude-sonnet-4-6
+      bedrock-model-id: zai.glm-5
+      region: us-east-1
+      capabilities:
+        - text
+        - vision
+    - id: mapping-003
+      model-name: claude-haiku-4-5
+      bedrock-model-id: deepseek.v3.2
+      region: us-east-1
+      capabilities:
+        - text
+
+auth:
+  platform-url: ${AUTH_PLATFORM_URL:http://localhost:8081/api/auth}
+  platform-timeout-seconds: 5
+  cache-ttl-seconds: 28800
+  mock-enabled: true  # 本地开发跳过认证，所有请求直接放行
+
+rate-limit:
+  default-rpm: 60
