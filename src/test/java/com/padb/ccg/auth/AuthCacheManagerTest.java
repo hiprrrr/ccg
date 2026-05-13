@@ -1,6 +1,7 @@
 package com.padb.ccg.auth;
 
 import com.padb.ccg.core.exception.ProviderException;
+import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -12,12 +13,9 @@ import org.mockito.quality.Strictness;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -40,71 +38,68 @@ class AuthCacheManagerTest {
 
     @Test
     void shouldReturnCachedDataOnHit() {
-        var auths = List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200)));
-        when(platformClient.fetchAuthorizations("user1")).thenReturn(Mono.just(auths));
+        var authResult = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200))));
+        when(platformClient.fetchAuthorization("token1")).thenReturn(Mono.just(authResult));
 
         // First call fills cache
-        cacheManager.getAuthorizations("user1").as(StepVerifier::create).expectNext(auths).verifyComplete();
+        cacheManager.getAuthorization("token1", "claude-opus").as(StepVerifier::create).expectNext(authResult).verifyComplete();
 
         // Second call should hit cache
-        cacheManager.getAuthorizations("user1").as(StepVerifier::create).expectNext(auths).verifyComplete();
+        cacheManager.getAuthorization("token1", "claude-opus").as(StepVerifier::create).expectNext(authResult).verifyComplete();
 
         // Platform was called only once
-        verify(platformClient, times(1)).fetchAuthorizations("user1");
+        verify(platformClient, times(1)).fetchAuthorization("token1");
     }
 
     @Test
     void shouldSingleflightConcurrentRequests() {
-        var auths = List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200)));
-        when(platformClient.fetchAuthorizations("user1")).thenReturn(Mono.just(auths));
+        var authResult = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200))));
+        when(platformClient.fetchAuthorization("token1")).thenReturn(Mono.just(authResult));
 
         // Three concurrent subscribers share one platform call
-        var r1 = cacheManager.getAuthorizations("user1");
-        var r2 = cacheManager.getAuthorizations("user1");
-        var r3 = cacheManager.getAuthorizations("user1");
+        var r1 = cacheManager.getAuthorization("token1", "claude-opus");
+        var r2 = cacheManager.getAuthorization("token1", "claude-opus");
+        var r3 = cacheManager.getAuthorization("token1", "claude-opus");
 
         StepVerifier.create(Mono.zip(r1, r2, r3))
                 .assertNext(t -> {
-                    assert t.getT1() == auths;
-                    assert t.getT2() == auths;
-                    assert t.getT3() == auths;
+                    assert t.getT1() == authResult;
+                    assert t.getT2() == authResult;
+                    assert t.getT3() == authResult;
                 })
                 .verifyComplete();
 
-        verify(platformClient, times(1)).fetchAuthorizations("user1");
+        verify(platformClient, times(1)).fetchAuthorization("token1");
     }
 
     @Test
-    void shouldFallbackToStaleWhenPlatformFailsAndCacheExpired() {
-        var fresh = List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(100)));
-        when(platformClient.fetchAuthorizations("user1"))
-                .thenReturn(Mono.just(fresh))       // first call succeeds
-                .thenReturn(Mono.error(new RuntimeException("platform down"))); // second fails
+    void shouldRefetchWhenCachedModelIsMissing() {
+        var first = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-sonnet", Instant.now().plusSeconds(7200))));
+        var refreshed = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200))));
+        when(platformClient.fetchAuthorization("token1"))
+                .thenReturn(Mono.just(first))
+                .thenReturn(Mono.just(refreshed));
 
-        // Use short TTL so cache expires quickly
-        when(props.cacheTtlSeconds()).thenReturn(0); // 0 means expiry check filters to defaultTtl=0
-        // Re-create manager with short TTL
-        cacheManager = new AuthCacheManager(platformClient, props);
+        cacheManager.getAuthorization("token1", "claude-sonnet").as(StepVerifier::create)
+                .expectNext(first).verifyComplete();
 
-        // First call fills cache (0s TTL means immediate expiry)
-        cacheManager.getAuthorizations("user1").as(StepVerifier::create)
-                .expectNext(fresh).verifyComplete();
-
-        // Need to wait a tiny bit for the nanos-based TTL to pass
-        try { Thread.sleep(10); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-
-        // Second call: cache miss (expired), platform fails → stale
-        StepVerifier.create(cacheManager.getAuthorizations("user1"))
-                .expectNext(fresh)
+        StepVerifier.create(cacheManager.getAuthorization("token1", "claude-opus"))
+                .expectNext(refreshed)
                 .verifyComplete();
+
+        verify(platformClient, times(2)).fetchAuthorization("token1");
     }
 
     @Test
     void shouldThrowWhenNoStaleAndPlatformFails() {
-        when(platformClient.fetchAuthorizations("user1"))
+        when(platformClient.fetchAuthorization("token1"))
                 .thenReturn(Mono.error(new RuntimeException("platform down")));
 
-        StepVerifier.create(cacheManager.getAuthorizations("user1"))
+        StepVerifier.create(cacheManager.getAuthorization("token1", "claude-opus"))
                 .expectErrorMatches(e -> e instanceof ProviderException
                         && e.getMessage().contains("Unable to verify authorization"))
                 .verify();
@@ -112,17 +107,18 @@ class AuthCacheManagerTest {
 
     @Test
     void shouldCleanInflightOnCancel() {
-        when(platformClient.fetchAuthorizations("user1"))
+        when(platformClient.fetchAuthorization("token1"))
                 .thenReturn(Mono.never());
 
-        var result = cacheManager.getAuthorizations("user1");
+        var result = cacheManager.getAuthorization("token1", "claude-opus");
         result.subscribe().dispose();
 
         // After cancel, a new fetch should proceed (not stuck on orphaned inflight)
-        var fresh = List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200)));
-        when(platformClient.fetchAuthorizations("user1")).thenReturn(Mono.just(fresh));
+        var fresh = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200))));
+        when(platformClient.fetchAuthorization("token1")).thenReturn(Mono.just(fresh));
 
-        StepVerifier.create(cacheManager.getAuthorizations("user1"))
+        StepVerifier.create(cacheManager.getAuthorization("token1", "claude-opus"))
                 .expectNext(fresh)
                 .verifyComplete();
     }

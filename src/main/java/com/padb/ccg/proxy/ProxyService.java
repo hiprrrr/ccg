@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 代理服务，编排完整的请求代理流程：
- * 1. 提取用户身份（x-api-key 或 Authorization: Bearer）和请求模型
+ * 1. 提取认证 Token（x-api-key 或 Authorization: Bearer）和请求模型
  * 2. 认证授权
  * 3. 限流检查
  * 4. 转发到 Bedrock（SSE 流式）
@@ -69,9 +69,9 @@ public class ProxyService {
         Instant start = Instant.now();
         String requestId = UUID.randomUUID().toString().substring(0, 8);
 
-        // 从请求头提取用户身份：优先兼容 Anthropic 的 x-api-key，回退到 Claude Code 常用的 Bearer token
-        String username = extractUsername(request);
-        if (username == null || username.isBlank()) {
+        // 从请求头提取认证 Token：优先兼容 Anthropic 的 x-api-key，回退到 Claude Code 常用的 Bearer token
+        String token = extractAuthToken(request);
+        if (token == null || token.isBlank()) {
             return respondError(403, "permission_error", "Missing x-api-key or Authorization Bearer token");
         }
 
@@ -82,8 +82,8 @@ public class ProxyService {
                     if (model == null) {
                         return respondError(400, "invalid_request_error", "Missing model in request body");
                     }
-                    log.info("Gateway request accepted: id={} user={} model={} bodyChars={} toolUse={} toolResult={} tools={}",
-                            requestId, username, model, body.length(),
+                    log.info("Gateway request accepted: id={} tokenHash={} model={} bodyChars={} toolUse={} toolResult={} tools={}",
+                            requestId, token.hashCode(), model, body.length(),
                             body.contains("\"tool_use\""), body.contains("\"tool_result\""), body.contains("\"tools\""));
 
                     // 查找 Bedrock 模型映射
@@ -100,12 +100,18 @@ public class ProxyService {
                     var errorRef = new AtomicReference<String>(null);
 
                     // 认证 → 限流 → 代理转发
-                    return authService.authorize(username, model)
-                            .then(Mono.defer(() -> rateLimiter.tryAcquire(username)))
+                    return authService.authorize(token, model)
+                            .flatMap(authResult -> {
+                                String personId = authResult.personId();
+                                recordRequestContentPlaceholder(personId, model, body);
+                                return rateLimiter.tryAcquire(personId)
+                                        .thenReturn(personId);
+                            })
                             .flatMap(ok -> {
+                                String personId = ok;
                                 // 构建 SSE 流，附加错误捕获和日志记录
                                 Flux<ServerSentEvent<String>> bedrockFlux = bedrockHandler
-                                        .forward(mapping, body, inputTokens, outputTokens, username, model, requestId);
+                                        .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
                                 Flux<ServerSentEvent<String>> heartbeatFlux = Flux
                                         .interval(SSE_HEARTBEAT_INTERVAL)
                                         // SSE 注释帧不会进入 Anthropic 事件流，但能保持连接活跃
@@ -124,26 +130,31 @@ public class ProxyService {
                                             // 流结束时记录请求日志（fire-and-forget）
                                             switch (signal) {
                                                 case ON_COMPLETE:
-                                                    log.info("SSE response completed: id={} user={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                                            requestId, username, model,
+                                                    log.info("SSE response completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, personId, model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
-                                                    logRequest(username, model, mapping.bedrockModelId(),
+                                                    logRequest(personId, model, mapping.bedrockModelId(),
                                                             true, null, inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case ON_ERROR:
-                                                    log.warn("SSE response errored: id={} user={} model={} durationMs={} error={}",
-                                                            requestId, username, model,
+                                                    log.warn("SSE response errored: id={} personId={} model={} durationMs={} error={}",
+                                                            requestId, personId, model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             errorRef.get());
-                                                    logRequest(username, model, mapping.bedrockModelId(),
+                                                    logRequest(personId, model, mapping.bedrockModelId(),
                                                             false, errorRef.get(), inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case CANCEL:
-                                                    log.info("SSE response cancelled: id={} user={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                                            requestId, username, model,
+                                                    log.info("SSE response cancelled: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, personId, model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
+                                                    if (inputTokens.get() > 0 || outputTokens.get() > 0) {
+                                                        logRequest(personId, model, mapping.bedrockModelId(),
+                                                                false, "client_cancelled",
+                                                                inputTokens.get(), outputTokens.get(), start);
+                                                    }
                                                     break;
                                                 default:
                                                     break;
@@ -159,10 +170,10 @@ public class ProxyService {
     }
 
     /**
-     * 从请求头提取用户名。Claude Code 使用 {@code ANTHROPIC_AUTH_TOKEN} 时会发送
-     * {@code Authorization: Bearer <token>}，这里将 token 作为网关用户名处理。
+     * 从请求头提取认证 Token。Claude Code 使用 {@code ANTHROPIC_AUTH_TOKEN} 时会发送
+     * {@code Authorization: Bearer <token>}。
      */
-    private String extractUsername(ServerRequest request) {
+    private String extractAuthToken(ServerRequest request) {
         String apiKey = request.headers().firstHeader("x-api-key");
         if (apiKey != null && !apiKey.isBlank()) {
             return apiKey.trim();
@@ -202,15 +213,23 @@ public class ProxyService {
     /**
      * 记录请求日志到数据库（fire-and-forget，不阻塞响应）
      */
-    private void logRequest(String username, String model, String bedrockModelId,
+    private void logRequest(String personId, String model, String bedrockModelId,
                             boolean success, String errorMsg,
                             int inputTokens, int outputTokens, Instant start) {
         int durationMs = (int) Duration.between(start, Instant.now()).toMillis();
-        requestLogger.log(new RequestLogEntry(username, model, bedrockModelId,
+        requestLogger.log(new RequestLogEntry(personId, model, bedrockModelId,
                 success, errorMsg,
                 inputTokens > 0 ? inputTokens : null,
                 outputTokens > 0 ? outputTokens : null,
                 durationMs, Instant.now()));
+    }
+
+    /**
+     * 请求内容留存占位：后续如需保存每次请求内容，在这里接入脱敏、截断、加密和 1 个月清理策略。
+     * 当前需求明确先不真正落库，避免提前保存可能包含敏感信息的 prompt 或代码内容。
+     */
+    private void recordRequestContentPlaceholder(String personId, String model, String body) {
+        // Intentionally empty.
     }
 
     /**

@@ -1,6 +1,7 @@
 package com.padb.ccg.auth;
 
 import com.padb.ccg.core.exception.UnauthorizedException;
+import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,10 +36,11 @@ class AuthServiceTest {
                 new ModelAuthorization("claude-opus-4-7", Instant.now().plusSeconds(7200)),
                 new ModelAuthorization("claude-sonnet-4-6", Instant.now().plusSeconds(3600))
         );
-        when(cacheManager.getAuthorizations("user1")).thenReturn(Mono.just(auths));
+        var authResult = new AuthResult("person1", Instant.now().plusSeconds(7200), auths);
+        when(cacheManager.getAuthorization("token1", "claude-opus-4-7")).thenReturn(Mono.just(authResult));
 
-        var result = authService.authorize("user1", "claude-opus-4-7");
-        StepVerifier.create(result).verifyComplete();
+        var result = authService.authorize("token1", "claude-opus-4-7");
+        StepVerifier.create(result).expectNext(authResult).verifyComplete();
     }
 
     @Test
@@ -46,9 +48,10 @@ class AuthServiceTest {
         var auths = List.of(
                 new ModelAuthorization("claude-sonnet-4-6", Instant.now().plusSeconds(3600))
         );
-        when(cacheManager.getAuthorizations("user1")).thenReturn(Mono.just(auths));
+        when(cacheManager.getAuthorization("token1", "claude-opus-4-7"))
+                .thenReturn(Mono.just(new AuthResult("person1", Instant.now().plusSeconds(7200), auths)));
 
-        var result = authService.authorize("user1", "claude-opus-4-7");
+        var result = authService.authorize("token1", "claude-opus-4-7");
         StepVerifier.create(result)
                 .expectErrorMatches(e -> e instanceof UnauthorizedException
                         && e.getMessage().contains("not authorized"))
@@ -60,9 +63,10 @@ class AuthServiceTest {
         var auths = List.of(
                 new ModelAuthorization("claude-opus-4-7", Instant.now().minusSeconds(60))
         );
-        when(cacheManager.getAuthorizations("user1")).thenReturn(Mono.just(auths));
+        when(cacheManager.getAuthorization("token1", "claude-opus-4-7"))
+                .thenReturn(Mono.just(new AuthResult("person1", Instant.now().plusSeconds(7200), auths)));
 
-        var result = authService.authorize("user1", "claude-opus-4-7");
+        var result = authService.authorize("token1", "claude-opus-4-7");
         StepVerifier.create(result)
                 .expectErrorMatches(e -> e instanceof UnauthorizedException
                         && e.getMessage().contains("expired"))
@@ -71,9 +75,10 @@ class AuthServiceTest {
 
     @Test
     void shouldRejectEmptyAuthorizationList() {
-        when(cacheManager.getAuthorizations("user1")).thenReturn(Mono.just(List.of()));
+        when(cacheManager.getAuthorization("token1", "claude-opus-4-7"))
+                .thenReturn(Mono.just(new AuthResult("person1", Instant.now().plusSeconds(7200), List.of())));
 
-        var result = authService.authorize("user1", "claude-opus-4-7");
+        var result = authService.authorize("token1", "claude-opus-4-7");
         StepVerifier.create(result)
                 .expectErrorMatches(e -> e instanceof UnauthorizedException)
                 .verify();
@@ -81,10 +86,10 @@ class AuthServiceTest {
 
     @Test
     void shouldPropagateAuthPlatformError() {
-        when(cacheManager.getAuthorizations("user1"))
+        when(cacheManager.getAuthorization("token1", "claude-opus-4-7"))
                 .thenReturn(Mono.error(new RuntimeException("platform unreachable")));
 
-        var result = authService.authorize("user1", "claude-opus-4-7");
+        var result = authService.authorize("token1", "claude-opus-4-7");
         StepVerifier.create(result)
                 .expectError(RuntimeException.class)
                 .verify();

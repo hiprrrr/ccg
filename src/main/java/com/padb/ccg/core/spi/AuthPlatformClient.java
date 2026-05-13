@@ -1,20 +1,18 @@
 package com.padb.ccg.core.spi;
 
-import com.padb.ccg.core.model.ModelAuthorization;
+import com.padb.ccg.core.model.AuthResult;
 import reactor.core.publisher.Mono;
 
-import java.util.List;
-
 /**
- * 认证平台客户端接口，用于从外部认证平台获取用户的模型授权列表
+ * 认证平台客户端接口，用于从外部认证平台根据 Token 获取个人身份和模型授权列表
  */
 public interface AuthPlatformClient {
 
     /**
-     * 获取指定用户已授权的模型列表
+     * 获取指定 Token 对应的个人身份和授权模型列表
      *
-     * @param username 用户名
-     * @return 模型授权列表的 Mono，包含模型名称及过期时间
+     * @param token 请求携带的认证 Token
+     * @return 认证结果的 Mono，包含个人 ID、Token 过期时间和模型授权列表
      */
-    Mono<List<ModelAuthorization>> fetchAuthorizations(String username);
+    Mono<AuthResult> fetchAuthorization(String token);
 }

@@ -11,8 +11,9 @@ import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.SignalType;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.retry.RetryPolicy;
 import software.amazon.awssdk.regions.Region;
@@ -56,6 +57,11 @@ public class BedrockProxyHandler {
     /** 仅工具链：与 {@link BedrockProperties#toolCallTraceEnabled()} 配套 */
     private static final Logger toolTrace = LoggerFactory.getLogger("com.padb.ccg.proxy.ToolCallTrace");
 
+    /**
+     * 进程级默认凭证链（EC2/EKS/IRSA 等），可自动轮换短期凭证；勿在 destroy 中关闭，避免与 JVM 内其他用法冲突。
+     */
+    private static final AwsCredentialsProvider DEFAULT_CREDENTIALS_PROVIDER = DefaultCredentialsProvider.create();
+
     private final BedrockProperties props;
     private final ObjectMapper objectMapper;
 
@@ -95,7 +101,7 @@ public class BedrockProxyHandler {
                 .build();
         return BedrockRuntimeAsyncClient.builder()
                 .region(Region.of(awsRegion))
-                .credentialsProvider(StaticCredentialsProvider.create(resolveCredentials()))
+                .credentialsProvider(bedrockCredentialsProvider())
                 .httpClient(http)
                 .overrideConfiguration(b -> b
                         .retryPolicy(RetryPolicy.builder().numRetries(props.retryMax()).build())
@@ -104,7 +110,22 @@ public class BedrockProxyHandler {
     }
 
     /**
-     * 根据配置解析 AWS 凭证：有 session token 时使用 STS 会话凭证，否则使用基本凭证
+     * Bedrock 客户端使用的凭证提供者。
+     * <p>若未配置 {@code bedrock.access-key}，则走 {@link DefaultCredentialsProvider}（实例元数据 / WebIdentity 等，SDK 会按链自动刷新）。</p>
+     * <p>若配置了静态密钥，则<strong>每次</strong> {@link AwsCredentialsProvider#resolveCredentials()} 时从 {@link BedrockProperties} 读取，
+     * 避免 {@code StaticCredentialsProvider} 把 STS 会话凭证冻结在「首次按 region 建连」时刻；配置中心或 RefreshScope 更新密钥后无需重启进程
+     * （仍需在过期前推送新 token；若从不刷新配置，临时凭证过期后只能换密钥或改用默认链）。</p>
+     */
+    private AwsCredentialsProvider bedrockCredentialsProvider() {
+        String ak = props.accessKey();
+        if (ak == null || ak.isBlank()) {
+            return DEFAULT_CREDENTIALS_PROVIDER;
+        }
+        return this::resolveCredentials;
+    }
+
+    /**
+     * 根据配置解析 AWS 凭证：有 session token 时使用 STS 会话凭证，否则使用基本凭证（由 {@link #bedrockCredentialsProvider()} 按需调用）
      */
     private software.amazon.awssdk.auth.credentials.AwsCredentials resolveCredentials() {
         String token = props.sessionToken();

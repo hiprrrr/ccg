@@ -80,8 +80,8 @@ bedrock:
   # 开启后 logger「com.padb.ccg.proxy.ToolCallTrace」会输出：
   #   REQUEST_OUT（请求发出）、RAW chunk（原始数据块）、
   #   UPSTREAM_SSE（上游 SSE 事件）、STREAM_DONE（流结束）等
-  # 注意：会输出大量日志，仅用于排查工具调用问题，勿长期开启
-  tool-call-trace-enabled: ${BEDROCK_TOOL_CALL_TRACE:true}
+  # 注意：会输出大量日志，仅用于排查工具调用问题，勿长期开启。
+  tool-call-trace-enabled: ${BEDROCK_TOOL_CALL_TRACE:false}
   # 追踪日志最大字符数：超过此长度的日志会被截断，避免日志过大
   tool-call-trace-max-chars: 6000
 

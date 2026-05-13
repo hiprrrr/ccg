@@ -67,7 +67,7 @@ public class RequestLoggerImpl implements RequestLogger {
     public void log(RequestLogEntry entry) {
         // 非阻塞入队，缓冲区满时丢弃并记录警告
         if (!buffer.offer(entry)) {
-            log.warn("Log buffer full ({}), dropping entry for user={}", BUFFER_CAPACITY, entry.username());
+            log.warn("Log buffer full ({}), dropping entry for personId={}", BUFFER_CAPACITY, entry.personId());
         }
     }
 
