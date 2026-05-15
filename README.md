@@ -1,4 +1,4 @@
-# ccgeteway
+# ccgateway
 
 LLM API 网关，部署在 K8s 上，对外兼容 Anthropic Messages API，将请求代理转发到 AWS Bedrock。
 
