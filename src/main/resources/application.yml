@@ -63,13 +63,13 @@ bedrock:
   region: ${BEDROCK_REGION:us-east-1}
   # AWS 访问密钥：用于认证 Bedrock API 调用
   # 必须通过环境变量 BEDROCK_ACCESS_KEY 注入，不可硬编码
-  access-key: ${BEDROCK_ACCESS_KEY:}
+  access-key: ${AWS_ACCESS_KEY_ID:}
   # AWS 密钥：与 access-key 配合使用
   # 必须通过环境变量 BEDROCK_SECRET_KEY 注入，不可硬编码
-  secret-key: ${BEDROCK_SECRET_KEY:}
+  secret-key: ${AWS_SECRET_ACCESS_KEY:}
   # AWS 会话令牌：临时凭证时使用，长期凭证可留空
   # 必须通过环境变量 BEDROCK_SESSION_TOKEN 注入
-  session-token: ${BEDROCK_SESSION_TOKEN:}
+  session-token: ${AWS_SESSION_TOKEN:}
   # 响应格式转换策略：
   # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
   # - passthrough: 直接透传 Bedrock 原始响应，不做转换

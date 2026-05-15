@@ -355,12 +355,26 @@ public final class BedrockInvokeBodyPreparer {
             }
             ObjectNode tool = (ObjectNode) t;
             normalizeToolInputSchema(tool);
+            // 过滤掉 Bedrock 不支持的托管工具类型（如 web_search_20250305, text_editor_20250728 等）
+            // Bedrock 只接受 custom 或 function 类型
+            JsonNode typeNode = tool.get("type");
+            if (typeNode != null && typeNode.isTextual()) {
+                String toolType = typeNode.asText();
+                // 托管工具类型格式：xxx_YYYYMMDD（如 web_search_20250305）
+                // 这些是 Anthropic 专属工具，Bedrock 不支持
+                if (!toolType.isEmpty() && !"custom".equals(toolType) && !"function".equals(toolType)) {
+                    // 检查是否是托管工具类型（包含日期格式的后缀）
+                    if (toolType.matches(".*_\\d{8}$")) {
+                        // 跳过不支持的托管工具
+                        continue;
+                    }
+                }
+            }
             // Z.ai：Anthropic 风格（缺省/ custom 类型 + name + input_schema）→ OpenAI function，才能触发真正的 tool_calls 流
             if (useZaiToolShape && shouldEmitOpenAiFunctionToolForZai(tool)) {
                 normalized.add(toOpenAiFunctionTool(tool));
                 continue;
             }
-            JsonNode typeNode = tool.get("type");
             boolean missing = !tool.has("type") || typeNode == null || typeNode.isNull();
             boolean blankText = typeNode != null && typeNode.isTextual() && typeNode.asText().isBlank();
             if (missing || blankText) {
