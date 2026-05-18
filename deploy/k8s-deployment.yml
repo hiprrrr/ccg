@@ -14,6 +14,7 @@ spec:
       labels:
         app: ccgeteway
     spec:
+      serviceAccountName: ccg-service-account
       terminationGracePeriodSeconds: 35
       containers:
         - name: ccgeteway
@@ -21,11 +22,6 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: APOLLO_META
-              valueFrom:
-                configMapKeyRef:
-                  name: ccgeteway-config
-                  key: apollo.meta
             - name: MYSQL_HOST
               valueFrom:
                 configMapKeyRef:
@@ -36,26 +32,16 @@ spec:
                 secretKeyRef:
                   name: ccgeteway-secret
                   key: mysql.user
-            - name: MYSQL_PASS
+            - name: MYSQL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: ccgeteway-secret
-                  key: mysql.pass
-            - name: BEDROCK_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ccgeteway-secret
-                  key: bedrock.access_key
-            - name: BEDROCK_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ccgeteway-secret
-                  key: bedrock.secret_key
+                  key: mysql.password
+            # AWS 区域配置（Bedrock 可用区域）
             - name: BEDROCK_REGION
-              valueFrom:
-                configMapKeyRef:
-                  name: ccgeteway-config
-                  key: bedrock.region
+              value: "us-east-1"
+            # 注意：不需要配置 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+            # IRSA 会自动通过 ServiceAccount 注入临时凭证
           resources:
             requests:
               cpu: 500m
