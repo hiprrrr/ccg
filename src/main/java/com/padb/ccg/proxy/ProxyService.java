@@ -43,18 +43,18 @@ public class ProxyService {
     private final AuthService authService;
     private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
-    private final BedrockProxyHandler bedrockHandler;
+    private final LlmUpstreamRouter upstreamRouter;
     private final RequestLogger requestLogger;
     private final ObjectMapper objectMapper;
 
     public ProxyService(AuthService authService, RateLimiter rateLimiter,
                         ProviderRegistryImpl providerRegistry,
-                        BedrockProxyHandler bedrockHandler, RequestLogger requestLogger,
+                        LlmUpstreamRouter upstreamRouter, RequestLogger requestLogger,
                         ObjectMapper objectMapper) {
         this.authService = authService;
         this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
-        this.bedrockHandler = bedrockHandler;
+        this.upstreamRouter = upstreamRouter;
         this.requestLogger = requestLogger;
         this.objectMapper = objectMapper;
     }
@@ -86,11 +86,11 @@ public class ProxyService {
                             requestId, token.hashCode(), model, body.length(),
                             body.contains("\"tool_use\""), body.contains("\"tool_result\""), body.contains("\"tools\""));
 
-                    // 查找 Bedrock 模型映射
+                    // 查找模型映射（AWS / 华为云）
                     var mappingOpt = providerRegistry.resolve(model);
                     if (mappingOpt.isEmpty()) {
-                        log.warn("No Bedrock mapping found for model='{}'", model);
-                        return respondError(502, "api_error", "No Bedrock model mapping configured for '" + model + "'");
+                        log.warn("No model mapping found for model='{}'", model);
+                        return respondError(502, "api_error", "No model mapping configured for '" + model + "'");
                     }
                     var mapping = mappingOpt.get();
 
@@ -110,7 +110,7 @@ public class ProxyService {
                             .flatMap(ok -> {
                                 String personId = ok;
                                 // 构建 SSE 流，附加错误捕获和日志记录
-                                Flux<ServerSentEvent<String>> bedrockFlux = bedrockHandler
+                                Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
                                         .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
                                 Flux<ServerSentEvent<String>> heartbeatFlux = Flux
                                         .interval(SSE_HEARTBEAT_INTERVAL)
@@ -130,29 +130,28 @@ public class ProxyService {
                                             // 流结束时记录请求日志（fire-and-forget）
                                             switch (signal) {
                                                 case ON_COMPLETE:
-                                                    log.info("SSE response completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                                            requestId, personId, model,
+                                                    log.info("SSE response completed: id={} personId={} provider={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, personId, mapping.provider(), model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
-                                                    logRequest(personId, model, mapping.bedrockModelId(),
-                                                            true, null, inputTokens.get(), outputTokens.get(), start);
+                                                    logRequest(personId, mapping, true, null,
+                                                            inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case ON_ERROR:
-                                                    log.warn("SSE response errored: id={} personId={} model={} durationMs={} error={}",
-                                                            requestId, personId, model,
+                                                    log.warn("SSE response errored: id={} personId={} provider={} model={} durationMs={} error={}",
+                                                            requestId, personId, mapping.provider(), model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             errorRef.get());
-                                                    logRequest(personId, model, mapping.bedrockModelId(),
-                                                            false, errorRef.get(), inputTokens.get(), outputTokens.get(), start);
+                                                    logRequest(personId, mapping, false, errorRef.get(),
+                                                            inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case CANCEL:
-                                                    log.info("SSE response cancelled: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                                            requestId, personId, model,
+                                                    log.info("SSE response cancelled: id={} personId={} provider={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                                            requestId, personId, mapping.provider(), model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
                                                     if (inputTokens.get() > 0 || outputTokens.get() > 0) {
-                                                        logRequest(personId, model, mapping.bedrockModelId(),
-                                                                false, "client_cancelled",
+                                                        logRequest(personId, mapping, false, "client_cancelled",
                                                                 inputTokens.get(), outputTokens.get(), start);
                                                     }
                                                     break;
@@ -213,12 +212,11 @@ public class ProxyService {
     /**
      * 记录请求日志到数据库（fire-and-forget，不阻塞响应）
      */
-    private void logRequest(String personId, String model, String bedrockModelId,
-                            boolean success, String errorMsg,
+    private void logRequest(String personId, ProviderConfig mapping, boolean success, String errorMsg,
                             int inputTokens, int outputTokens, Instant start) {
         int durationMs = (int) Duration.between(start, Instant.now()).toMillis();
-        requestLogger.log(new RequestLogEntry(personId, model, bedrockModelId,
-                success, errorMsg,
+        requestLogger.log(new RequestLogEntry(personId, mapping.modelName(), mapping.provider(),
+                mapping.upstreamModelId(), success, errorMsg,
                 inputTokens > 0 ? inputTokens : null,
                 outputTokens > 0 ? outputTokens : null,
                 durationMs, Instant.now()));

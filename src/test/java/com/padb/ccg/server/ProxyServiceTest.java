@@ -3,10 +3,12 @@ package com.padb.ccg.server;
 import com.padb.ccg.auth.AuthService;
 import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
+import com.padb.ccg.core.model.ProviderChannel;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.spi.RateLimiter;
 import com.padb.ccg.core.spi.RequestLogger;
-import com.padb.ccg.proxy.BedrockProxyHandler;
+import com.padb.ccg.proxy.LlmUpstreamRouter;
+import com.padb.ccg.proxy.OpenAiProxyService;
 import com.padb.ccg.proxy.ProxyService;
 import com.padb.ccg.routing.ProviderRegistryImpl;
 import org.junit.jupiter.api.Test;
@@ -41,7 +43,10 @@ class ProxyServiceTest {
     private ProviderRegistryImpl providerRegistry;
 
     @MockBean
-    private BedrockProxyHandler bedrockHandler;
+    private LlmUpstreamRouter upstreamRouter;
+
+    @MockBean
+    private OpenAiProxyService openAiProxyService;
 
     @MockBean
     private RequestLogger requestLogger;
@@ -88,7 +93,7 @@ class ProxyServiceTest {
 
     @Test
     void shouldReturn403WhenUnauthorized() {
-        var mapping = new ProviderConfig("m-1", "claude-opus-4-7",
+        var mapping = new ProviderConfig(ProviderChannel.AWS, "claude-opus-4-7",
                 "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
         when(providerRegistry.resolve("claude-opus-4-7")).thenReturn(Optional.of(mapping));
         when(authService.authorize("token1", "claude-opus-4-7"))
@@ -105,14 +110,14 @@ class ProxyServiceTest {
 
     @Test
     void shouldAcceptBearerTokenAndUsePersonId() {
-        var mapping = new ProviderConfig("m-1", "claude-opus-4-7",
+        var mapping = new ProviderConfig(ProviderChannel.AWS, "claude-opus-4-7",
                 "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
         var authResult = new AuthResult("person1", java.time.Instant.now().plusSeconds(7200),
                 java.util.List.of(new ModelAuthorization("claude-opus-4-7", java.time.Instant.now().plusSeconds(7200))));
         when(providerRegistry.resolve("claude-opus-4-7")).thenReturn(Optional.of(mapping));
         when(authService.authorize("token1", "claude-opus-4-7")).thenReturn(Mono.just(authResult));
         when(rateLimiter.tryAcquire("person1")).thenReturn(Mono.just(true));
-        when(bedrockHandler.forward(eq(mapping), anyString(), any(), any(), eq("person1"), eq("claude-opus-4-7"), anyString()))
+        when(upstreamRouter.forward(eq(mapping), anyString(), any(), any(), eq("person1"), eq("claude-opus-4-7"), anyString()))
                 .thenReturn(reactor.core.publisher.Flux.empty());
 
         webClient.post()

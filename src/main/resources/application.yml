@@ -62,14 +62,12 @@ bedrock:
   # 不同区域的模型可用性可能不同
   region: ${BEDROCK_REGION:us-east-1}
   # AWS 访问密钥：用于认证 Bedrock API 调用
-  # 必须通过环境变量 BEDROCK_ACCESS_KEY 注入，不可硬编码
-  access-key: ${AWS_ACCESS_KEY_ID:}
+  # 优先 BEDROCK_ACCESS_KEY（K8s Secret / Apollo），其次标准 AWS_ACCESS_KEY_ID
+  access-key: ${BEDROCK_ACCESS_KEY:${AWS_ACCESS_KEY_ID:}}
   # AWS 密钥：与 access-key 配合使用
-  # 必须通过环境变量 BEDROCK_SECRET_KEY 注入，不可硬编码
-  secret-key: ${AWS_SECRET_ACCESS_KEY:}
-  # AWS 会话令牌：临时凭证时使用，长期凭证可留空
-  # 必须通过环境变量 BEDROCK_SESSION_TOKEN 注入
-  session-token: ${AWS_SESSION_TOKEN:}
+  secret-key: ${BEDROCK_SECRET_KEY:${AWS_SECRET_ACCESS_KEY:}}
+  # AWS 会话令牌：STS 临时凭证（ASIA 开头 access key）必填
+  session-token: ${BEDROCK_SESSION_TOKEN:${AWS_SESSION_TOKEN:}}
   # 响应格式转换策略：
   # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
   # - passthrough: 直接透传 Bedrock 原始响应，不做转换
@@ -93,31 +91,40 @@ bedrock:
   # 追踪日志最大字符数：超过此长度的日志会被截断，避免日志过大
   tool-call-trace-max-chars: 6000
 
-  # ---------------------------------------------------------------------------
-  # 模型映射配置：将请求中的模型名称映射到 Bedrock 模型
-  # ---------------------------------------------------------------------------
-  model-mappings:
-    # 映射配置 ID：用于标识此映射配置
-    - id: mapping-001
-      # 对外暴露的模型名称：客户端请求时使用的模型名称
-      model-name: glm-5
-      # Bedrock 模型 ID：实际调用 Bedrock 时使用的模型标识
-      bedrock-model-id: zai.glm-5
-      # 模型所在区域：可覆盖全局 region 配置
-      region: us-east-1
-      # 模型能力列表：声明该模型支持的功能
-      capabilities:
-        - text      # 支持 文本生成
-        - vision    # 支持 图像理解（多模态）
-        - tools     # 支持 工具调用（Function Calling）
-        - stream    # 支持 流式输出（SSE）
+# ============================================================================
+# 华为云 MaaS 模型代理配置（Anthropic 兼容接口）
+# ============================================================================
+huawei-maas:
+  # Anthropic 兼容 API 根地址（不含 /v1/messages）
+  # 中国-香港等区域示例：https://api-ap-southeast-1.modelarts-maas.com/anthropic
+  base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/anthropic}
+  # MaaS API Key，对应请求头 x-api-key
+  api-key: ${HUAWEI_MAAS_API_KEY:}
+  retry-max: 3
+  timeout-seconds: 300
 
-    - id: mapping-003
-      model-name: deepseek
-      bedrock-model-id: deepseek.v3.2
-      region: us-east-1
-      capabilities:
-        - text      # 仅支持文本生成
+# ============================================================================
+# 模型映射：model-name 下声明 provider（aws / huawei）及同级的上游参数
+# ============================================================================
+model-mappings:
+  - model-name: glm-5
+    provider: aws
+    upstream-model-id: zai.glm-5
+    region: us-east-1
+    capabilities:
+      - text
+      - vision
+      - tools
+      - stream
+
+  - model-name: glm-5.1
+    provider: huawei
+    upstream-model-id: glm-5.1
+    capabilities:
+      - text
+      - vision
+      - tools
+      - stream
 
 # ============================================================================
 # 认证配置

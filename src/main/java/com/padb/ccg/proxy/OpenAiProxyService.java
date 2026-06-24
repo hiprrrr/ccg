@@ -47,18 +47,18 @@ public class OpenAiProxyService {
     private final AuthService authService;
     private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
-    private final BedrockProxyHandler bedrockHandler;
+    private final LlmUpstreamRouter upstreamRouter;
     private final RequestLogger requestLogger;
     private final ObjectMapper objectMapper;
 
     public OpenAiProxyService(AuthService authService, RateLimiter rateLimiter,
                               ProviderRegistryImpl providerRegistry,
-                              BedrockProxyHandler bedrockHandler, RequestLogger requestLogger,
+                              LlmUpstreamRouter upstreamRouter, RequestLogger requestLogger,
                               ObjectMapper objectMapper) {
         this.authService = authService;
         this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
-        this.bedrockHandler = bedrockHandler;
+        this.upstreamRouter = upstreamRouter;
         this.requestLogger = requestLogger;
         this.objectMapper = objectMapper;
     }
@@ -94,10 +94,10 @@ public class OpenAiProxyService {
                     log.info("OpenAI request accepted: id={} tokenHash={} model={} stream={} bodyChars={}",
                             requestId, token.hashCode(), model, streamRequested, body.length());
 
-                    // 查找 Bedrock 模型映射
+                    // 查找模型映射（AWS / 华为云）
                     var mappingOpt = providerRegistry.resolve(model);
                     if (mappingOpt.isEmpty()) {
-                        log.warn("No Bedrock mapping found for model='{}'", model);
+                        log.warn("No model mapping found for model='{}'", model);
                         return respondOpenAiError(404, "model_not_found", "Model '" + model + "' not found");
                     }
                     var mapping = mappingOpt.get();
@@ -140,7 +140,7 @@ public class OpenAiProxyService {
         openAiConverterRef.set(new OpenAiSseConverter(objectMapper, model));
 
         // 获取 Bedrock 的 Anthropic 格式 SSE 流
-        Flux<ServerSentEvent<String>> bedrockFlux = bedrockHandler
+        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
                 .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
 
         // 心跳流
@@ -180,16 +180,16 @@ public class OpenAiProxyService {
                                     requestId, personId, model,
                                     Duration.between(start, Instant.now()).toMillis(),
                                     inputTokens.get(), outputTokens.get());
-                            logRequest(personId, model, mapping.bedrockModelId(),
-                                    true, null, inputTokens.get(), outputTokens.get(), start);
+                            logRequest(personId, mapping, true, null,
+                                    inputTokens.get(), outputTokens.get(), start);
                             break;
                         case ON_ERROR:
                             log.warn("OpenAI SSE response errored: id={} personId={} model={} durationMs={} error={}",
                                     requestId, personId, model,
                                     Duration.between(start, Instant.now()).toMillis(),
                                     errorRef.get());
-                            logRequest(personId, model, mapping.bedrockModelId(),
-                                    false, errorRef.get(), inputTokens.get(), outputTokens.get(), start);
+                            logRequest(personId, mapping, false, errorRef.get(),
+                                    inputTokens.get(), outputTokens.get(), start);
                             break;
                         case CANCEL:
                             log.info("OpenAI SSE response cancelled: id={} personId={} model={} durationMs={}",
@@ -223,7 +223,7 @@ public class OpenAiProxyService {
         openAiConverterRef.set(new OpenAiSseConverter(objectMapper, model));
 
         // 获取 Bedrock 的 Anthropic 格式 SSE 流
-        Flux<ServerSentEvent<String>> bedrockFlux = bedrockHandler
+        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
                 .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
 
         // 收集所有内容并构建完整响应
@@ -291,8 +291,8 @@ public class OpenAiProxyService {
                             requestId, personId, model,
                             Duration.between(start, Instant.now()).toMillis(),
                             inputTokens.get(), outputTokens.get());
-                    logRequest(personId, model, mapping.bedrockModelId(),
-                            true, null, inputTokens.get(), outputTokens.get(), start);
+                    logRequest(personId, mapping, true, null,
+                            inputTokens.get(), outputTokens.get(), start);
 
                     try {
                         String jsonResponse = objectMapper.writeValueAsString(response);
@@ -447,12 +447,11 @@ public class OpenAiProxyService {
     /**
      * 记录请求日志到数据库
      */
-    private void logRequest(String personId, String model, String bedrockModelId,
-                            boolean success, String errorMsg,
+    private void logRequest(String personId, ProviderConfig mapping, boolean success, String errorMsg,
                             int inputTokens, int outputTokens, Instant start) {
         int durationMs = (int) Duration.between(start, Instant.now()).toMillis();
-        requestLogger.log(new RequestLogEntry(personId, model, bedrockModelId,
-                success, errorMsg,
+        requestLogger.log(new RequestLogEntry(personId, mapping.modelName(), mapping.provider(),
+                mapping.upstreamModelId(), success, errorMsg,
                 inputTokens > 0 ? inputTokens : null,
                 outputTokens > 0 ? outputTokens : null,
                 durationMs, Instant.now()));

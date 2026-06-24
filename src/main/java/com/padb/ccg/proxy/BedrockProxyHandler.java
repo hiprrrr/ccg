@@ -179,7 +179,7 @@ public class BedrockProxyHandler {
                             boolean toolsEnabled = supportsTools(mapping);
                             boolean streamingEnabled = supportsStreaming(mapping);
                             bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
-                                    objectMapper, stripped, username, mapping.bedrockModelId(),
+                                    objectMapper, stripped, username, mapping.upstreamModelId(),
                                     toolsEnabled, streamingEnabled);
                         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
                             log.warn("Bedrock body metadata normalize failed, using stripped body: {}", e.getMessage());
@@ -193,11 +193,11 @@ public class BedrockProxyHandler {
                             return;
                         }
 
-                        logToolRequestOutbound(correlationId, username, model, mapping.bedrockModelId(), bodyForBedrock);
+                        logToolRequestOutbound(correlationId, username, model, mapping.upstreamModelId(), bodyForBedrock);
 
                         // 构建 Bedrock 流式调用请求
                         var request = InvokeModelWithResponseStreamRequest.builder()
-                                .modelId(mapping.bedrockModelId())
+                                .modelId(mapping.upstreamModelId())
                                 .contentType("application/json")
                                 .accept("application/json")
                                 .body(SdkBytes.fromString(bodyForBedrock, StandardCharsets.UTF_8))
@@ -287,7 +287,7 @@ public class BedrockProxyHandler {
                                             if (props.toolCallTraceEnabled()) {
                                                 String tsum = c.summarizeToolConversionAtStreamEnd();
                                                 toolTrace.info("ToolTrace STREAM_DONE traceId={} user={} userModel={} bedrockModelId={} rawChunks={} lifecycle={} syntheticInitialTail={} inputTok={} outputTok={} tools={}",
-                                                        correlationId, username, model, mapping.bedrockModelId(),
+                                                        correlationId, username, model, mapping.upstreamModelId(),
                                                         rawChunkSeq.get(), c.debugLifecycleState(), c.isSyntheticInitialTailUsed(),
                                                         c.getInputTokens(), c.getOutputTokens(),
                                                         tsum.isEmpty() ? "(no_tool_buffer)" : tsum);
@@ -343,13 +343,13 @@ public class BedrockProxyHandler {
                                     AtomicBoolean streamCompleted,
                                     String traceId) {
         var request = InvokeModelRequest.builder()
-                .modelId(mapping.bedrockModelId())
+                .modelId(mapping.upstreamModelId())
                 .contentType("application/json")
                 .accept("application/json")
                 .body(SdkBytes.fromString(bodyForBedrock, StandardCharsets.UTF_8))
                 .build();
 
-        logToolRequestOutbound(traceId, username, model, mapping.bedrockModelId(), bodyForBedrock);
+        logToolRequestOutbound(traceId, username, model, mapping.upstreamModelId(), bodyForBedrock);
 
         CompletableFuture<Void> future = client.invokeModel(request)
                 .thenAccept(response -> {
@@ -373,7 +373,7 @@ public class BedrockProxyHandler {
                                     String tsum = conv.summarizeToolConversionAtStreamEnd();
                                     if (data.contains("\"tool_calls\"") || !tsum.isEmpty()) {
                                         toolTrace.info("ToolTrace NON_STREAM_DONE traceId={} user={} userModel={} bedrockModelId={} lifecycle={} syntheticInitialTail={} inputTok={} outputTok={} tools={}",
-                                                traceId, username, model, mapping.bedrockModelId(),
+                                                traceId, username, model, mapping.upstreamModelId(),
                                                 conv.debugLifecycleState(), conv.isSyntheticInitialTailUsed(),
                                                 conv.getInputTokens(), conv.getOutputTokens(),
                                                 tsum.isEmpty() ? "(no_tool_buffer)" : tsum);

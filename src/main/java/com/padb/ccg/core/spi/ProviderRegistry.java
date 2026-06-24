@@ -5,7 +5,7 @@ import com.padb.ccg.core.model.ProviderConfig;
 import java.util.Optional;
 
 /**
- * 模型供应商标识解析接口，负责将用户请求的模型名称映射到具体的 Bedrock 供应商配置
+ * 模型供应商标识解析接口，负责将用户请求的模型名称映射到具体的上游供应商配置（AWS / 华为云）
  */
 public interface ProviderRegistry {
 
