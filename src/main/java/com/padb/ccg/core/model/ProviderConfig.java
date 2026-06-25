@@ -24,4 +24,9 @@ public record ProviderConfig(ProviderChannel provider, String modelName, String 
             capabilities = List.copyOf(capabilities);
         }
     }
+
+    /** 是否声明了视觉能力（content 中可含 image / image_url 块） */
+    public boolean supportsVision() {
+        return capabilities != null && capabilities.contains("vision");
+    }
 }

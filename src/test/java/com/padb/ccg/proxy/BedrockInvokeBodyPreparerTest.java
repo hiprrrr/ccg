@@ -31,13 +31,14 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
-    void normalizeMetadata_preservesExistingToolType() throws Exception {
+    void normalizeMetadata_dropsHostedToolWithDateSuffix() throws Exception {
         String in = """
                 {"max_tokens":10,"messages":[{"role":"user","content":"hi"}],
                  "tools":[{"type":"bash_20241022","name":"bash"}]}""";
         String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1");
-        assertThat(out).contains("\"type\":\"bash_20241022\"");
-        assertThat(out).doesNotContain("\"type\":\"custom\"");
+        // Bedrock 不支持 Anthropic 托管工具类型，应被丢弃
+        assertThat(out).doesNotContain("\"type\":\"bash_20241022\"");
+        assertThat(out).contains("\"tools\":[]");
     }
 
     @Test
@@ -56,13 +57,14 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
-    void normalizeMetadata_preservesHostedToolsForZaiGlm() throws Exception {
+    void normalizeMetadata_dropsHostedToolsForZaiGlm() throws Exception {
         String in = """
                 {"max_tokens":10,"messages":[{"role":"user","content":"hi"}],
                  "tools":[{"type":"text_editor_20250728","name":"str_replace_editor"}]}""";
         String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
-        assertThat(out).contains("\"type\":\"text_editor_20250728\"");
-        assertThat(out).doesNotContain("\"custom\":");
+        // Bedrock 不支持 Anthropic 托管工具类型，即便走 zai.glm-5 也应被丢弃
+        assertThat(out).doesNotContain("\"type\":\"text_editor_20250728\"");
+        assertThat(out).contains("\"tools\":[]");
     }
 
     @Test

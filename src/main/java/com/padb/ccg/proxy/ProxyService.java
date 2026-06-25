@@ -6,7 +6,10 @@ import com.padb.ccg.core.spi.RateLimiter;
 import com.padb.ccg.core.spi.RequestLogger;
 import com.padb.ccg.routing.ProviderRegistryImpl;
 import com.padb.ccg.auth.AuthService;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -94,6 +97,25 @@ public class ProxyService {
                     }
                     var mapping = mappingOpt.get();
 
+                    // 非视觉模型：剥离图片块为占位文本，避免长会话历史中残留 image 导致上游 400
+                    String preparedBody = body;
+                    if (!mapping.supportsVision() && hasImageContent(body)) {
+                        try {
+                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
+                                    objectMapper, body, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
+                        } catch (Exception e) {
+                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
+                                    model, requestId, e.getMessage());
+                            return respondError(400, "invalid_request_error",
+                                    "Model '" + model + "' does not support image input");
+                        }
+                    }
+
+                    // 归一化图片块：部分客户端（如 cc-switch）会把 OpenAI 风格的 image_url 块
+                    // 发到 /v1/messages，这里统一转成 Anthropic 的 image 块，避免上游 400
+                    final String normalizedBody = normalizeImageBlocks(preparedBody);
+
                     // 初始化 token 计数器和错误引用
                     var inputTokens = new AtomicInteger(0);
                     var outputTokens = new AtomicInteger(0);
@@ -111,7 +133,7 @@ public class ProxyService {
                                 String personId = ok;
                                 // 构建 SSE 流，附加错误捕获和日志记录
                                 Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
-                                        .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
+                                        .forward(mapping, normalizedBody, inputTokens, outputTokens, personId, model, requestId);
                                 Flux<ServerSentEvent<String>> heartbeatFlux = Flux
                                         .interval(SSE_HEARTBEAT_INTERVAL)
                                         // SSE 注释帧不会进入 Anthropic 事件流，但能保持连接活跃
@@ -228,6 +250,114 @@ public class ProxyService {
      */
     private void recordRequestContentPlaceholder(String personId, String model, String body) {
         // Intentionally empty.
+    }
+
+    /**
+     * 判断请求体是否含图片 content 块（Anthropic type=image 或 OpenAI type=image_url）。
+     * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。
+     */
+    private boolean hasImageContent(String body) {
+        if (body == null || (!body.contains("\"image\"") && !body.contains("\"image_url\""))) {
+            return false;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            JsonNode messages = root.path("messages");
+            if (!messages.isArray()) {
+                return false;
+            }
+            for (JsonNode msg : messages) {
+                JsonNode content = msg.path("content");
+                if (!content.isArray()) {
+                    continue;
+                }
+                for (JsonNode block : content) {
+                    String t = block.path("type").asText();
+                    if ("image".equals(t) || "image_url".equals(t)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * 将请求体中 OpenAI 风格的 image_url content 块归一化为 Anthropic 的 image 块。
+     * 不含 image_url 时原样返回，避免无谓的序列化开销。
+     */
+    private String normalizeImageBlocks(String body) {
+        if (body == null || !body.contains("\"image_url\"")) {
+            return body;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            if (!(root instanceof ObjectNode rootObj)) {
+                return body;
+            }
+            JsonNode messages = rootObj.path("messages");
+            if (!messages.isArray()) {
+                return body;
+            }
+            boolean changed = false;
+            for (JsonNode msg : messages) {
+                if (!(msg instanceof ObjectNode msgObj)) {
+                    continue;
+                }
+                JsonNode content = msgObj.path("content");
+                if (!(content instanceof ArrayNode contentArr)) {
+                    continue;
+                }
+                for (int i = 0; i < contentArr.size(); i++) {
+                    JsonNode block = contentArr.get(i);
+                    if ("image_url".equals(block.path("type").asText())) {
+                        contentArr.set(i, convertImageUrlBlock(block));
+                        changed = true;
+                    }
+                }
+            }
+            return changed ? objectMapper.writeValueAsString(rootObj) : body;
+        } catch (Exception e) {
+            log.warn("Failed to normalize image_url blocks: {}", e.getMessage());
+            return body;
+        }
+    }
+
+    /**
+     * 单个 OpenAI image_url 块 → Anthropic image 块。
+     * - data URI → source.type=base64（拆出 media_type 与 base64 data）
+     * - http/https → source.type=url
+     */
+    private JsonNode convertImageUrlBlock(JsonNode block) {
+        String url = block.path("image_url").path("url").asText("");
+        int commaIdx = url.indexOf(',');
+        if (url.startsWith("data:") && commaIdx > 0) {
+            String header = url.substring(5, commaIdx);
+            int semiIdx = header.indexOf(';');
+            String mediaType = semiIdx > 0 ? header.substring(0, semiIdx) : header;
+            String data = url.substring(commaIdx + 1);
+            ObjectNode imageBlock = objectMapper.createObjectNode();
+            imageBlock.put("type", "image");
+            ObjectNode source = imageBlock.putObject("source");
+            source.put("type", "base64");
+            source.put("media_type", mediaType);
+            source.put("data", data);
+            return imageBlock;
+        } else if (url.startsWith("http://") || url.startsWith("https://")) {
+            ObjectNode imageBlock = objectMapper.createObjectNode();
+            imageBlock.put("type", "image");
+            ObjectNode source = imageBlock.putObject("source");
+            source.put("type", "url");
+            source.put("url", url);
+            return imageBlock;
+        }
+        // 无法识别的 URL 格式：降级为占位文本，避免原样透传 image_url 导致上游 400
+        ObjectNode textBlock = objectMapper.createObjectNode();
+        textBlock.put("type", "text");
+        textBlock.put("text", AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+        return textBlock;
     }
 
     /**

@@ -131,10 +131,13 @@ public class HuaweiMaasProxyHandler {
 
     /**
      * 将请求体中的 model 替换为上游模型 ID，并按能力声明设置 stream 字段。
+     * 华为 MaaS 当前仅支持 text content，需剥离历史会话中残留的 image / image_url 块。
      */
     private String prepareRequestBody(String requestBody, String upstreamModelId, boolean streaming)
             throws JsonProcessingException {
-        JsonNode rootNode = objectMapper.readTree(requestBody);
+        String stripped = AnthropicMessageImageStripper.stripImageBlocks(
+                objectMapper, requestBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+        JsonNode rootNode = objectMapper.readTree(stripped);
         if (!(rootNode instanceof ObjectNode root)) {
             throw new JsonProcessingException("Request body must be a JSON object") {};
         }

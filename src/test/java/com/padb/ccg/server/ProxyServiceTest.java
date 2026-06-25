@@ -17,6 +17,8 @@ import org.springframework.boot.test.autoconfigure.web.reactive.WebFluxTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.web.reactive.server.WebTestClient;
+import org.springframework.web.reactive.function.server.ServerRequest;
+import org.springframework.web.reactive.function.server.ServerResponse;
 import reactor.core.publisher.Mono;
 
 import java.util.Optional;
@@ -125,6 +127,34 @@ class ProxyServiceTest {
                 .header("Authorization", "Bearer token1")
                 .header("Content-Type", "application/json")
                 .bodyValue("{\"model\":\"claude-opus-4-7\"}")
+                .exchange()
+                .expectStatus().isOk();
+    }
+
+    @Test
+    void shouldRouteChatCompletionsWithoutV1Prefix() {
+        when(openAiProxyService.process(any(ServerRequest.class)))
+                .thenReturn(ServerResponse.ok().build());
+
+        webClient.post()
+                .uri("/chat/completions")
+                .header("x-api-key", "token1")
+                .header("Content-Type", "application/json")
+                .bodyValue("{\"model\":\"glm-5\",\"messages\":[]}")
+                .exchange()
+                .expectStatus().isOk();
+    }
+
+    @Test
+    void shouldRouteResponsesWithoutV1Prefix() {
+        when(openAiProxyService.processResponses(any(ServerRequest.class)))
+                .thenReturn(ServerResponse.ok().build());
+
+        webClient.post()
+                .uri("/responses")
+                .header("x-api-key", "token1")
+                .header("Content-Type", "application/json")
+                .bodyValue("{\"model\":\"glm-5\",\"input\":\"hi\"}")
                 .exchange()
                 .expectStatus().isOk();
     }

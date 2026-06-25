@@ -101,6 +101,22 @@ public class OpenAiProxyService {
                     }
                     var mapping = mappingOpt.get();
 
+                    // 非视觉模型：剥离图片块为占位文本，避免长会话历史中残留 image 导致上游 400
+                    String preparedBody = finalConvertedBody;
+                    if (!mapping.supportsVision() && hasImageContent(finalConvertedBody)) {
+                        try {
+                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
+                                    objectMapper, finalConvertedBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
+                        } catch (Exception e) {
+                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
+                                    model, requestId, e.getMessage());
+                            return respondOpenAiError(400, "invalid_request_error",
+                                    "Model '" + model + "' does not support image input");
+                        }
+                    }
+                    final String bodyToForward = preparedBody;
+
                     // 初始化 token 计数器和错误引用
                     var inputTokens = new AtomicInteger(0);
                     var outputTokens = new AtomicInteger(0);
@@ -115,15 +131,243 @@ public class OpenAiProxyService {
                             })
                             .flatMap(personId -> {
                                 if (streamRequested) {
-                                    return handleStreamingRequest(mapping, finalConvertedBody, personId, model, requestId,
+                                    return handleStreamingRequest(mapping, bodyToForward, personId, model, requestId,
                                             inputTokens, outputTokens, errorRef, start);
                                 } else {
-                                    return handleNonStreamingRequest(mapping, finalConvertedBody, personId, model, requestId,
+                                    return handleNonStreamingRequest(mapping, bodyToForward, personId, model, requestId,
                                             inputTokens, outputTokens, start);
                                 }
                             });
                 })
                 .onErrorResume(e -> handleError(e));
+    }
+
+    /**
+     * 处理 OpenAI Responses API（{@code POST /v1/responses}）代理请求。
+     */
+    public Mono<ServerResponse> processResponses(ServerRequest request) {
+        Instant start = Instant.now();
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
+
+        String token = extractAuthToken(request);
+        if (token == null || token.isBlank()) {
+            return respondOpenAiError(401, "invalid_request_error", "Missing API key");
+        }
+
+        return request.bodyToMono(String.class)
+                .flatMap(body -> {
+                    String model = extractModel(body);
+                    if (model == null) {
+                        return respondOpenAiError(400, "invalid_request_error", "Missing model in request body");
+                    }
+
+                    boolean streamRequested = isStreamRequested(body);
+                    String convertedBody = OpenAiResponsesRequestConverter.toAnthropic(objectMapper, body);
+                    if (convertedBody == null) {
+                        return respondOpenAiError(400, "invalid_request_error", "Invalid Responses API request body");
+                    }
+
+                    log.info("OpenAI Responses request accepted: id={} tokenHash={} model={} stream={} bodyChars={}",
+                            requestId, token.hashCode(), model, streamRequested, body.length());
+
+                    var mappingOpt = providerRegistry.resolve(model);
+                    if (mappingOpt.isEmpty()) {
+                        log.warn("No model mapping found for model='{}'", model);
+                        return respondOpenAiError(404, "model_not_found", "Model '" + model + "' not found");
+                    }
+                    var mapping = mappingOpt.get();
+
+                    String preparedBody = convertedBody;
+                    if (!mapping.supportsVision() && hasImageContent(convertedBody)) {
+                        try {
+                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
+                                    objectMapper, convertedBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
+                        } catch (Exception e) {
+                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
+                                    model, requestId, e.getMessage());
+                            return respondOpenAiError(400, "invalid_request_error",
+                                    "Model '" + model + "' does not support image input");
+                        }
+                    }
+                    final String bodyToForward = preparedBody;
+
+                    var inputTokens = new AtomicInteger(0);
+                    var outputTokens = new AtomicInteger(0);
+                    var errorRef = new AtomicReference<String>(null);
+
+                    return authService.authorize(token, model)
+                            .flatMap(authResult -> {
+                                String personId = authResult.personId();
+                                return rateLimiter.tryAcquire(personId)
+                                        .thenReturn(personId);
+                            })
+                            .flatMap(personId -> {
+                                if (streamRequested) {
+                                    return handleResponsesStreamingRequest(mapping, bodyToForward, personId, model,
+                                            requestId, inputTokens, outputTokens, errorRef, start);
+                                }
+                                return handleResponsesNonStreamingRequest(mapping, bodyToForward, personId, model,
+                                        requestId, inputTokens, outputTokens, start);
+                            });
+                })
+                .onErrorResume(e -> handleError(e));
+    }
+
+    /**
+     * 处理 Responses API 流式请求。
+     */
+    private Mono<ServerResponse> handleResponsesStreamingRequest(ProviderConfig mapping, String body, String personId,
+                                                                String model, String requestId,
+                                                                AtomicInteger inputTokens, AtomicInteger outputTokens,
+                                                                AtomicReference<String> errorRef, Instant start) {
+        var responsesConverterRef = new AtomicReference<OpenAiResponsesSseConverter>(null);
+        responsesConverterRef.set(new OpenAiResponsesSseConverter(objectMapper, model));
+
+        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
+                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
+
+        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
+                .interval(SSE_HEARTBEAT_INTERVAL)
+                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
+
+        Flux<ServerSentEvent<String>> responsesFlux = bedrockFlux
+                .flatMap(event -> {
+                    String data = event.data();
+                    if (data == null || data.isEmpty()) {
+                        return Flux.empty();
+                    }
+                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
+                    if (converter == null) {
+                        return Flux.empty();
+                    }
+                    return Flux.fromIterable(converter.convert(data));
+                })
+                .concatWith(Flux.defer(() -> {
+                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
+                    if (converter == null) {
+                        return Flux.empty();
+                    }
+                    return Flux.fromIterable(converter.endStreamIfOpen());
+                }))
+                .publish(shared -> Flux.merge(
+                        shared,
+                        heartbeatFlux.takeUntilOther(shared.ignoreElements())
+                ))
+                .doOnError(e -> {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    errorRef.set(msg);
+                })
+                .doFinally(signal -> {
+                    switch (signal) {
+                        case ON_COMPLETE:
+                            log.info("OpenAI Responses SSE completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                    requestId, personId, model,
+                                    Duration.between(start, Instant.now()).toMillis(),
+                                    inputTokens.get(), outputTokens.get());
+                            logRequest(personId, mapping, true, null,
+                                    inputTokens.get(), outputTokens.get(), start);
+                            break;
+                        case ON_ERROR:
+                            log.warn("OpenAI Responses SSE errored: id={} personId={} model={} durationMs={} error={}",
+                                    requestId, personId, model,
+                                    Duration.between(start, Instant.now()).toMillis(),
+                                    errorRef.get());
+                            logRequest(personId, mapping, false, errorRef.get(),
+                                    inputTokens.get(), outputTokens.get(), start);
+                            break;
+                        case CANCEL:
+                            log.info("OpenAI Responses SSE cancelled: id={} personId={} model={} durationMs={}",
+                                    requestId, personId, model,
+                                    Duration.between(start, Instant.now()).toMillis());
+                            break;
+                        default:
+                            break;
+                    }
+                });
+
+        return ServerResponse.ok()
+                .contentType(MediaType.TEXT_EVENT_STREAM)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .body(BodyInserters.fromServerSentEvents(responsesFlux));
+    }
+
+    /**
+     * 处理 Responses API 非流式请求，返回完整 response 对象。
+     */
+    private Mono<ServerResponse> handleResponsesNonStreamingRequest(ProviderConfig mapping, String body, String personId,
+                                                                     String model, String requestId,
+                                                                     AtomicInteger inputTokens, AtomicInteger outputTokens,
+                                                                     Instant start) {
+        var responsesConverterRef = new AtomicReference<OpenAiResponsesSseConverter>(null);
+        responsesConverterRef.set(new OpenAiResponsesSseConverter(objectMapper, model));
+
+        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
+                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
+
+        return bedrockFlux
+                .flatMap(event -> {
+                    String data = event.data();
+                    if (data == null || data.isEmpty()) {
+                        return Flux.empty();
+                    }
+                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
+                    if (converter != null) {
+                        converter.convert(data);
+                    }
+                    return Flux.empty();
+                })
+                .then(Mono.defer(() -> {
+                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
+                    if (converter != null) {
+                        converter.endStreamIfOpen();
+                    }
+
+                    ObjectNode response = objectMapper.createObjectNode();
+                    response.put("id", converter != null ? converter.getResponseId() : "resp_unknown");
+                    response.put("object", "response");
+                    response.put("created_at", System.currentTimeMillis() / 1000);
+                    response.put("status", converter != null ? converter.getFinishStatus() : "completed");
+                    response.put("model", model);
+                    response.putNull("error");
+                    response.putNull("incomplete_details");
+
+                    ArrayNode output = response.putArray("output");
+                    if (converter != null && !converter.getAccumulatedText().isEmpty()) {
+                        ObjectNode message = output.addObject();
+                        message.put("type", "message");
+                        message.put("id", "msg_" + UUID.randomUUID().toString().substring(0, 8));
+                        message.put("role", "assistant");
+                        message.put("status", "completed");
+                        ArrayNode content = message.putArray("content");
+                        ObjectNode textPart = content.addObject();
+                        textPart.put("type", "output_text");
+                        textPart.put("text", converter.getAccumulatedText());
+                        textPart.putArray("annotations");
+                    }
+
+                    ObjectNode usage = response.putObject("usage");
+                    int inTok = converter != null ? converter.getInputTokens() : inputTokens.get();
+                    int outTok = converter != null ? converter.getOutputTokens() : outputTokens.get();
+                    usage.put("input_tokens", inTok);
+                    usage.put("output_tokens", outTok);
+                    usage.put("total_tokens", inTok + outTok);
+
+                    log.info("OpenAI Responses non-stream completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                            requestId, personId, model,
+                            Duration.between(start, Instant.now()).toMillis(),
+                            inTok, outTok);
+                    logRequest(personId, mapping, true, null, inTok, outTok, start);
+
+                    try {
+                        return ServerResponse.ok()
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .bodyValue(objectMapper.writeValueAsString(response));
+                    } catch (Exception e) {
+                        return respondOpenAiError(500, "internal_error", "Failed to serialize response");
+                    }
+                }));
     }
 
     /**
@@ -360,7 +604,14 @@ public class OpenAiProxyService {
                         if (content.isTextual()) {
                             convertedMsg.put("content", content.asText());
                         } else if (content.isArray()) {
-                            convertedMsg.set("content", content);
+                            // 逐块翻译 OpenAI content 块为 Anthropic 格式：
+                            // - text 原样保留
+                            // - image_url 拆成 Anthropic image 块（data URI → base64，http(s) → url）
+                            // 其他不认识的类型原样透传，由上游校验
+                            ArrayNode anthropicContent = convertedMsg.putArray("content");
+                            for (JsonNode block : content) {
+                                anthropicContent.add(convertContentBlock(block));
+                            }
                         }
                     }
                 }
@@ -422,6 +673,43 @@ public class OpenAiProxyService {
     }
 
     /**
+     * 将单个 OpenAI content 块翻译为 Anthropic content 块。
+     * - text: 原样保留
+     * - image_url (data URI): → image / source.type=base64，拆出 media_type 与 base64 data
+     * - image_url (http/https): → image / source.type=url
+     * - 其他: 原样透传，交由上游校验
+     */
+    private JsonNode convertContentBlock(JsonNode block) {
+        String type = block.path("type").asText();
+        if ("image_url".equals(type)) {
+            String url = block.path("image_url").path("url").asText("");
+            int commaIdx = url.indexOf(',');
+            if (url.startsWith("data:") && commaIdx > 0) {
+                // data:image/png;base64,XXXX → media_type=image/png, data=XXXX
+                String header = url.substring(5, commaIdx); // 形如 image/png;base64
+                int semiIdx = header.indexOf(';');
+                String mediaType = semiIdx > 0 ? header.substring(0, semiIdx) : header;
+                String data = url.substring(commaIdx + 1);
+                ObjectNode imageBlock = objectMapper.createObjectNode();
+                imageBlock.put("type", "image");
+                ObjectNode source = imageBlock.putObject("source");
+                source.put("type", "base64");
+                source.put("media_type", mediaType);
+                source.put("data", data);
+                return imageBlock;
+            } else if (url.startsWith("http://") || url.startsWith("https://")) {
+                ObjectNode imageBlock = objectMapper.createObjectNode();
+                imageBlock.put("type", "image");
+                ObjectNode source = imageBlock.putObject("source");
+                source.put("type", "url");
+                source.put("url", url);
+                return imageBlock;
+            }
+        }
+        return block;
+    }
+
+    /**
      * 从请求头提取认证 Token
      */
     private String extractAuthToken(ServerRequest request) {
@@ -472,6 +760,37 @@ public class OpenAiProxyService {
                 inputTokens > 0 ? inputTokens : null,
                 outputTokens > 0 ? outputTokens : null,
                 durationMs, Instant.now()));
+    }
+
+    /**
+     * 判断 Anthropic 格式请求体是否含图片 content 块（type=image）。
+     * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。
+     */
+    private boolean hasImageContent(String body) {
+        if (body == null || !body.contains("\"image\"")) {
+            return false;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            JsonNode messages = root.path("messages");
+            if (!messages.isArray()) {
+                return false;
+            }
+            for (JsonNode msg : messages) {
+                JsonNode content = msg.path("content");
+                if (!content.isArray()) {
+                    continue;
+                }
+                for (JsonNode block : content) {
+                    if ("image".equals(block.path("type").asText())) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
     }
 
     /**

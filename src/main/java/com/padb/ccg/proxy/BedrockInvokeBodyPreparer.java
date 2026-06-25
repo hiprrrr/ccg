@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
@@ -26,6 +28,8 @@ import java.util.List;
  * </p>
  */
 public final class BedrockInvokeBodyPreparer {
+
+    private static final Logger log = LoggerFactory.getLogger(BedrockInvokeBodyPreparer.class);
 
     /** Bedrock 对 metadata.user_id 一类标识的常见允许字符集（保守子集） */
     private static final int MAX_USER_ID_LEN = 128;
@@ -151,8 +155,14 @@ public final class BedrockInvokeBodyPreparer {
             } else {
                 ObjectNode out = root.objectNode();
                 out.put("role", role);
-                String text = contentToText(content);
-                out.put("content", text);
+                // 含图片块的 content：保留为 OpenAI 多模态 content 数组（image → image_url）
+                // 纯文本：保持原有拍平为字符串的行为，避免对存量请求有任何改动
+                if (content != null && content.isArray() && hasBlockType(content, "image")) {
+                    out.set("content", contentToOpenAiArray(root, content));
+                } else {
+                    String text = contentToText(content);
+                    out.put("content", text);
+                }
                 normalized.add(out);
             }
         }
@@ -339,6 +349,50 @@ public final class BedrockInvokeBodyPreparer {
     }
 
     /**
+     * 将 Anthropic content 块数组翻译为 OpenAI 多模态 content 数组。
+     * - text 块 → {"type":"text","text":"..."}
+     * - image 块 (source.type=base64) → {"type":"image_url","image_url":{"url":"data:<media_type>;base64,<data>"}}
+     * - image 块 (source.type=url)     → {"type":"image_url","image_url":{"url":"<url>"}}
+     * 其他块类型原样透传，交由上游校验。
+     */
+    private static ArrayNode contentToOpenAiArray(ObjectNode root, JsonNode content) {
+        ArrayNode out = root.arrayNode();
+        for (JsonNode block : content) {
+            if (!block.isObject()) {
+                continue;
+            }
+            String type = block.path("type").asText();
+            if ("text".equals(type)) {
+                ObjectNode textBlock = root.objectNode();
+                textBlock.put("type", "text");
+                textBlock.put("text", block.path("text").asText(""));
+                out.add(textBlock);
+            } else if ("image".equals(type)) {
+                JsonNode source = block.path("source");
+                String sourceType = source.path("type").asText();
+                ObjectNode imageBlock = root.objectNode();
+                imageBlock.put("type", "image_url");
+                ObjectNode imageUrl = imageBlock.putObject("image_url");
+                if ("base64".equals(sourceType)) {
+                    String mediaType = source.path("media_type").asText("image/png");
+                    String data = source.path("data").asText("");
+                    imageUrl.put("url", "data:" + mediaType + ";base64," + data);
+                } else if ("url".equals(sourceType)) {
+                    imageUrl.put("url", source.path("url").asText(""));
+                } else {
+                    // 未知 source 类型：原样透传 image 块，让上游报错暴露问题
+                    out.add(block);
+                    continue;
+                }
+                out.add(imageBlock);
+            } else {
+                out.add(block);
+            }
+        }
+        return out;
+    }
+
+    /**
      * Bedrock 要求 {@code tools[]} 每个元素都有 {@code type}；Anthropic 直连允许省略。
      * 对 {@code zai.*}：优先将 name+input_schema 转为 OpenAI {@code function}；其余再补 {@code custom} 或透传。
      */
@@ -365,7 +419,9 @@ public final class BedrockInvokeBodyPreparer {
                 if (!toolType.isEmpty() && !"custom".equals(toolType) && !"function".equals(toolType)) {
                     // 检查是否是托管工具类型（包含日期格式的后缀）
                     if (toolType.matches(".*_\\d{8}$")) {
-                        // 跳过不支持的托管工具
+                        // 跳过 Bedrock 不支持的托管工具，并记 warn 让丢弃可见
+                        log.warn("Dropping unsupported Anthropic hosted tool type='{}' name='{}' (Bedrock only accepts custom/function)",
+                                toolType, tool.path("name").asText(""));
                         continue;
                     }
                 }

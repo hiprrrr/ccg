@@ -10,7 +10,8 @@ import reactor.core.publisher.Mono;
 /**
  * 网关 HTTP 请求处理器，将请求委托给相应的代理服务处理：
  * - /v1/messages → ProxyService（Anthropic 格式）
- * - /v1/chat/completions → OpenAiProxyService（OpenAI 兼容格式）
+ * - /v1/chat/completions、/chat/completions → OpenAiProxyService（OpenAI Chat Completions 兼容格式）
+ * - /v1/responses、/responses → OpenAiProxyService（OpenAI Responses API 格式）
  * 并提供健康检查端点。
  */
 @Component
@@ -35,13 +36,23 @@ public class GatewayHandler {
     }
 
     /**
-     * 处理 /v1/chat/completions 的代理请求（OpenAI 兼容格式）
+     * 处理 /v1/chat/completions、/chat/completions 的代理请求（OpenAI Chat Completions 兼容格式）
      *
      * @param request 服务端请求
      * @return 服务端响应 Mono
      */
     public Mono<ServerResponse> handleOpenAi(ServerRequest request) {
         return openAiProxyService.process(request);
+    }
+
+    /**
+     * 处理 /v1/responses、/responses 的代理请求（OpenAI Responses API 格式）
+     *
+     * @param request 服务端请求
+     * @return 服务端响应 Mono
+     */
+    public Mono<ServerResponse> handleOpenAiResponses(ServerRequest request) {
+        return openAiProxyService.processResponses(request);
     }
 
     /**
