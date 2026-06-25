@@ -24,7 +24,6 @@ import reactor.core.publisher.Mono;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -333,12 +332,27 @@ public class OpenAiProxyService {
                 anthropic.put("model", root.get("model").asText());
             }
 
-            // 消息转换
+            // 消息转换：OpenAI 把 system 放在 messages 里，Anthropic 要求顶层 system 字段，
+            // 因此把 role=system 的消息抽出来拼成顶层 system，其余消息原样保留
             if (root.has("messages")) {
                 ArrayNode messages = anthropic.putArray("messages");
+                StringBuilder systemText = new StringBuilder();
                 for (JsonNode msg : root.get("messages")) {
-                    ObjectNode convertedMsg = messages.addObject();
                     String role = msg.path("role").asText();
+
+                    // system 消息：提取文本内容到顶层 system 字段，跳过 messages 数组
+                    if ("system".equals(role)) {
+                        JsonNode sysContent = msg.get("content");
+                        if (sysContent != null && sysContent.isTextual()) {
+                            if (systemText.length() > 0) {
+                                systemText.append("\n\n");
+                            }
+                            systemText.append(sysContent.asText());
+                        }
+                        continue;
+                    }
+
+                    ObjectNode convertedMsg = messages.addObject();
                     convertedMsg.put("role", role);
 
                     JsonNode content = msg.get("content");
@@ -349,6 +363,9 @@ public class OpenAiProxyService {
                             convertedMsg.set("content", content);
                         }
                     }
+                }
+                if (systemText.length() > 0) {
+                    anthropic.put("system", systemText.toString());
                 }
             }
 
@@ -461,15 +478,15 @@ public class OpenAiProxyService {
      * 构建 OpenAI 兼容的 JSON 错误响应
      */
     private Mono<ServerResponse> respondOpenAiError(int status, String type, String message) {
+        // 直接用 Jackson 构建 JSON，避免 Map.of 不允许 null 值导致的 NPE
+        ObjectNode error = objectMapper.createObjectNode();
+        error.put("message", message);
+        error.put("type", type);
+        error.putNull("param");
+        error.put("code", type);
+        ObjectNode body = objectMapper.createObjectNode();
+        body.set("error", error);
         try {
-            Map<String, Object> body = Map.of(
-                    "error", Map.of(
-                            "message", message,
-                            "type", type,
-                            "param", (Object) null,
-                            "code", type
-                    )
-            );
             byte[] bytes = objectMapper.writeValueAsBytes(body);
             return ServerResponse.status(status)
                     .header("Content-Type", "application/json")
