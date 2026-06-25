@@ -92,13 +92,15 @@ bedrock:
   tool-call-trace-max-chars: 6000
 
 # ============================================================================
-# 华为云 MaaS 模型代理配置（Anthropic 兼容接口）
+# 华为云 MaaS 模型代理配置
 # ============================================================================
 huawei-maas:
-  # Anthropic 兼容 API 根地址（不含 /v1/messages）
-  # 中国-香港等区域示例：https://api-ap-southeast-1.modelarts-maas.com/anthropic
-  base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/anthropic}
-  # MaaS API Key，对应请求头 x-api-key
+  # 上游 API 格式：anthropic（默认）或 openai
+  # - anthropic: base-url 示例 https://api-ap-southeast-1.modelarts-maas.com/anthropic → /v1/messages，鉴权 x-api-key
+  # - openai:    base-url 示例 https://api-ap-southeast-1.modelarts-maas.com/openai/v1 → /chat/completions，鉴权 Bearer
+  api-format: ${HUAWEI_MAAS_API_FORMAT:openai}
+  # 未配置时按 api-format 使用默认域名；也可显式覆盖
+  base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/openai/v1}
   api-key: ${HUAWEI_MAAS_API_KEY:}
   retry-max: 3
   timeout-seconds: 300

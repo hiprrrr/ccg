@@ -1,5 +1,6 @@
 package com.padb.ccg.proxy;
 
+import com.padb.ccg.core.model.ProviderChannel;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.model.RequestLogEntry;
 import com.padb.ccg.core.spi.RateLimiter;
@@ -47,17 +48,20 @@ public class OpenAiProxyService {
     private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
     private final LlmUpstreamRouter upstreamRouter;
+    private final HuaweiMaasProperties huaweiMaasProperties;
     private final RequestLogger requestLogger;
     private final ObjectMapper objectMapper;
 
     public OpenAiProxyService(AuthService authService, RateLimiter rateLimiter,
                               ProviderRegistryImpl providerRegistry,
-                              LlmUpstreamRouter upstreamRouter, RequestLogger requestLogger,
+                              LlmUpstreamRouter upstreamRouter, HuaweiMaasProperties huaweiMaasProperties,
+                              RequestLogger requestLogger,
                               ObjectMapper objectMapper) {
         this.authService = authService;
         this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
         this.upstreamRouter = upstreamRouter;
+        this.huaweiMaasProperties = huaweiMaasProperties;
         this.requestLogger = requestLogger;
         this.objectMapper = objectMapper;
     }
@@ -86,36 +90,38 @@ public class OpenAiProxyService {
                     // 检测是否为流式请求
                     boolean streamRequested = isStreamRequested(body);
 
-                    // 转换请求体（OpenAI → Anthropic 格式）
-                    String convertedBody = convertRequestBody(body);
-                    final String finalConvertedBody = convertedBody != null ? convertedBody : body;
-
                     log.info("OpenAI request accepted: id={} tokenHash={} model={} stream={} bodyChars={}",
                             requestId, token.hashCode(), model, streamRequested, body.length());
 
-                    // 查找模型映射（AWS / 华为云）
                     var mappingOpt = providerRegistry.resolve(model);
                     if (mappingOpt.isEmpty()) {
                         log.warn("No model mapping found for model='{}'", model);
                         return respondOpenAiError(404, "model_not_found", "Model '" + model + "' not found");
                     }
                     var mapping = mappingOpt.get();
+                    boolean huaweiOpenAiPassthrough = isHuaweiOpenAiPassthrough(mapping);
 
-                    // 非视觉模型：剥离图片块为占位文本，避免长会话历史中残留 image 导致上游 400
-                    String preparedBody = finalConvertedBody;
-                    if (!mapping.supportsVision() && hasImageContent(finalConvertedBody)) {
-                        try {
-                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
-                                    objectMapper, finalConvertedBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
-                        } catch (Exception e) {
-                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
-                                    model, requestId, e.getMessage());
-                            return respondOpenAiError(400, "invalid_request_error",
-                                    "Model '" + model + "' does not support image input");
+                    final String bodyToForward;
+                    if (huaweiOpenAiPassthrough) {
+                        bodyToForward = body;
+                    } else {
+                        String convertedBody = convertRequestBody(body);
+                        String anthropicBody = convertedBody != null ? convertedBody : body;
+                        if (!mapping.supportsVision() && hasImageContent(anthropicBody)) {
+                            try {
+                                bodyToForward = AnthropicMessageImageStripper.stripImageBlocks(
+                                        objectMapper, anthropicBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+                                log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
+                            } catch (Exception e) {
+                                log.warn("Failed to strip image blocks for model='{}' id={}: {}",
+                                        model, requestId, e.getMessage());
+                                return respondOpenAiError(400, "invalid_request_error",
+                                        "Model '" + model + "' does not support image input");
+                            }
+                        } else {
+                            bodyToForward = anthropicBody;
                         }
                     }
-                    final String bodyToForward = preparedBody;
 
                     // 初始化 token 计数器和错误引用
                     var inputTokens = new AtomicInteger(0);
@@ -130,13 +136,20 @@ public class OpenAiProxyService {
                                         .thenReturn(personId);
                             })
                             .flatMap(personId -> {
+                                if (huaweiOpenAiPassthrough) {
+                                    if (streamRequested) {
+                                        return handleHuaweiOpenAiStreamingRequest(mapping, bodyToForward, personId,
+                                                model, requestId, inputTokens, outputTokens, errorRef, start);
+                                    }
+                                    return handleHuaweiOpenAiNonStreamingRequest(mapping, bodyToForward, personId,
+                                            model, requestId, inputTokens, outputTokens, start);
+                                }
                                 if (streamRequested) {
                                     return handleStreamingRequest(mapping, bodyToForward, personId, model, requestId,
                                             inputTokens, outputTokens, errorRef, start);
-                                } else {
-                                    return handleNonStreamingRequest(mapping, bodyToForward, personId, model, requestId,
-                                            inputTokens, outputTokens, start);
                                 }
+                                return handleNonStreamingRequest(mapping, bodyToForward, personId, model, requestId,
+                                        inputTokens, outputTokens, start);
                             });
                 })
                 .onErrorResume(e -> handleError(e));
@@ -368,6 +381,89 @@ public class OpenAiProxyService {
                         return respondOpenAiError(500, "internal_error", "Failed to serialize response");
                     }
                 }));
+    }
+
+    /** 华为 MaaS 配置为 OpenAI 上游时，{@code /v1/chat/completions} 可透传 OpenAI 协议。 */
+    private boolean isHuaweiOpenAiPassthrough(ProviderConfig mapping) {
+        return mapping.provider() == ProviderChannel.HUAWEI && huaweiMaasProperties.isOpenAiFormat();
+    }
+
+    /**
+     * 华为 OpenAI 上游流式透传：不经 Anthropic 中转，直接转发 OpenAI SSE。
+     */
+    private Mono<ServerResponse> handleHuaweiOpenAiStreamingRequest(ProviderConfig mapping, String body,
+                                                                     String personId, String model, String requestId,
+                                                                     AtomicInteger inputTokens, AtomicInteger outputTokens,
+                                                                     AtomicReference<String> errorRef, Instant start) {
+        Flux<ServerSentEvent<String>> upstreamFlux = upstreamRouter
+                .forwardOpenAi(mapping, body, inputTokens, outputTokens, personId, model, requestId);
+
+        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
+                .interval(SSE_HEARTBEAT_INTERVAL)
+                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
+
+        Flux<ServerSentEvent<String>> sseFlux = upstreamFlux
+                .publish(shared -> Flux.merge(
+                        shared,
+                        heartbeatFlux.takeUntilOther(shared.ignoreElements())
+                ))
+                .doOnError(e -> {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    errorRef.set(msg);
+                })
+                .doFinally(signal -> {
+                    switch (signal) {
+                        case ON_COMPLETE -> {
+                            log.info("Huawei OpenAI SSE passthrough completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                                    requestId, personId, model,
+                                    Duration.between(start, Instant.now()).toMillis(),
+                                    inputTokens.get(), outputTokens.get());
+                            logRequest(personId, mapping, true, null,
+                                    inputTokens.get(), outputTokens.get(), start);
+                        }
+                        case ON_ERROR -> {
+                            log.warn("Huawei OpenAI SSE passthrough errored: id={} personId={} model={} error={}",
+                                    requestId, personId, model, errorRef.get());
+                            logRequest(personId, mapping, false, errorRef.get(),
+                                    inputTokens.get(), outputTokens.get(), start);
+                        }
+                        default -> {
+                        }
+                    }
+                });
+
+        return ServerResponse.ok()
+                .contentType(MediaType.TEXT_EVENT_STREAM)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .body(BodyInserters.fromServerSentEvents(sseFlux));
+    }
+
+    /**
+     * 华为 OpenAI 上游非流式透传：直接返回上游 JSON 响应。
+     */
+    private Mono<ServerResponse> handleHuaweiOpenAiNonStreamingRequest(ProviderConfig mapping, String body,
+                                                                          String personId, String model,
+                                                                          String requestId,
+                                                                          AtomicInteger inputTokens,
+                                                                          AtomicInteger outputTokens, Instant start) {
+        return upstreamRouter.forwardOpenAi(mapping, body, inputTokens, outputTokens, personId, model, requestId)
+                .next()
+                .flatMap(event -> {
+                    String json = event.data();
+                    if (json == null || json.isBlank()) {
+                        return respondOpenAiError(502, "api_error", "Empty response from Huawei MaaS");
+                    }
+                    log.info("Huawei OpenAI non-stream passthrough completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
+                            requestId, personId, model,
+                            Duration.between(start, Instant.now()).toMillis(),
+                            inputTokens.get(), outputTokens.get());
+                    logRequest(personId, mapping, true, null,
+                            inputTokens.get(), outputTokens.get(), start);
+                    return ServerResponse.ok()
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .bodyValue(json);
+                });
     }
 
     /**

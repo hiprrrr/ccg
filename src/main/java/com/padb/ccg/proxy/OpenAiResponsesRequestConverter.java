@@ -134,7 +134,13 @@ public final class OpenAiResponsesRequestConverter {
             toolUse.put("type", "tool_use");
             toolUse.put("id", item.path("call_id").asText(item.path("id").asText("")));
             toolUse.put("name", item.path("name").asText(""));
-            toolUse.put("input", parseJsonObject(item.path("arguments").asText("{}")));
+            JsonNode args = item.get("arguments");
+            if (args != null && args.isObject()) {
+                toolUse.set("input", args);
+            } else {
+                String argsText = item.path("arguments").asText("{}");
+                toolUse.set("input", parseJsonObjectNode(objectMapper, argsText));
+            }
         }
     }
 
@@ -310,6 +316,22 @@ public final class OpenAiResponsesRequestConverter {
             return output.asText();
         }
         return output.toString();
+    }
+
+    /**
+     * 将 JSON 字符串解析为对象节点；非法 JSON 时返回空对象。
+     */
+    private static JsonNode parseJsonObjectNode(ObjectMapper objectMapper, String json) {
+        String trimmed = json == null ? "" : json.trim();
+        if (trimmed.isEmpty()) {
+            return objectMapper.createObjectNode();
+        }
+        try {
+            JsonNode node = objectMapper.readTree(trimmed);
+            return node.isObject() ? node : objectMapper.createObjectNode();
+        } catch (Exception e) {
+            return objectMapper.createObjectNode();
+        }
     }
 
     /**
