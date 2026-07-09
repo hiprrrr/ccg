@@ -19,13 +19,13 @@ class ProviderRegistryImplTest {
         var props = new ModelMappingsProperties();
         props.add(new ModelMappingsProperties.ModelMappingItem(
                 "claude-opus-4-7", ProviderChannel.AWS,
-                "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", List.of("text")));
+                "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", List.of("text"), List.of()));
         props.add(new ModelMappingsProperties.ModelMappingItem(
                 "claude-sonnet-4-6", ProviderChannel.AWS,
-                "us.anthropic.claude-sonnet-4-6-v1:0", "us-east-1", List.of("text", "vision")));
+                "us.anthropic.claude-sonnet-4-6-v1:0", "us-east-1", List.of("text", "vision"), List.of()));
         props.add(new ModelMappingsProperties.ModelMappingItem(
                 "deepseek-huawei", ProviderChannel.HUAWEI,
-                "deepseek-v3.2", null, List.of("text", "stream")));
+                "deepseek-v3.2", null, List.of("text", "stream"), List.of()));
         registry = new ProviderRegistryImpl(props);
         registry.init();
     }

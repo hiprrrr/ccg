@@ -65,7 +65,7 @@ public class BedrockProxyHandler {
     private final BedrockProperties props;
     private final ObjectMapper objectMapper;
 
-    /** 按区域缓存 BedrockAsyncClient，避免重复创建 */
+    /** 按区域 + 账号缓存 BedrockAsyncClient，避免重复创建 */
     private final Map<String, BedrockRuntimeAsyncClient> clients = new ConcurrentHashMap<>();
 
     public BedrockProxyHandler(BedrockProperties props, ObjectMapper objectMapper) {
@@ -91,7 +91,7 @@ public class BedrockProxyHandler {
      * 创建带 Netty 读/写超时配置的异步 Bedrock 客户端。
      * <p>默认 Netty 客户端两次读事件间隔约 30s 即超时；大模型首包或 chunk 间隔可能超过该值，需与 {@link BedrockProperties#timeoutSeconds()} 一致。</p>
      */
-    private BedrockRuntimeAsyncClient buildBedrockClientForRegion(String awsRegion) {
+    private BedrockRuntimeAsyncClient buildBedrockClient(String awsRegion, AwsCredentialsProvider credentialsProvider) {
         int sec = Math.max(1, props.timeoutSeconds());
         Duration d = Duration.ofSeconds(sec);
         SdkAsyncHttpClient http = NettyNioAsyncHttpClient.builder()
@@ -101,7 +101,7 @@ public class BedrockProxyHandler {
                 .build();
         return BedrockRuntimeAsyncClient.builder()
                 .region(Region.of(awsRegion))
-                .credentialsProvider(bedrockCredentialsProvider())
+                .credentialsProvider(credentialsProvider)
                 .httpClient(http)
                 .overrideConfiguration(b -> b
                         .retryPolicy(RetryPolicy.builder().numRetries(props.retryMax()).build())
@@ -109,30 +109,29 @@ public class BedrockProxyHandler {
                 .build();
     }
 
-    /**
-     * Bedrock 客户端使用的凭证提供者。
-     * <p>若未配置 {@code bedrock.access-key}，则走 {@link DefaultCredentialsProvider}（实例元数据 / WebIdentity 等，SDK 会按链自动刷新）。</p>
-     * <p>若配置了静态密钥，则<strong>每次</strong> {@link AwsCredentialsProvider#resolveCredentials()} 时从 {@link BedrockProperties} 读取，
-     * 避免 {@code StaticCredentialsProvider} 把 STS 会话凭证冻结在「首次按 region 建连」时刻；配置中心或 RefreshScope 更新密钥后无需重启进程
-     * （仍需在过期前推送新 token；若从不刷新配置，临时凭证过期后只能换密钥或改用默认链）。</p>
-     */
-    private AwsCredentialsProvider bedrockCredentialsProvider() {
-        String ak = props.accessKey();
-        if (ak == null || ak.isBlank()) {
+    private BedrockRuntimeAsyncClient getBedrockClient(String awsRegion, UpstreamAccountSelector.AwsSelection account) {
+        String cacheKey = awsRegion + ":" + account.accountId();
+        return clients.computeIfAbsent(cacheKey, ignored -> buildBedrockClient(
+                awsRegion, credentialsProviderFor(account)));
+    }
+
+    private AwsCredentialsProvider credentialsProviderFor(UpstreamAccountSelector.AwsSelection account) {
+        if (account.useDefaultChain()) {
             return DEFAULT_CREDENTIALS_PROVIDER;
         }
-        return this::resolveCredentials;
+        return () -> resolveCredentials(account);
     }
 
     /**
-     * 根据配置解析 AWS 凭证：有 session token 时使用 STS 会话凭证，否则使用基本凭证（由 {@link #bedrockCredentialsProvider()} 按需调用）
+     * 根据账号选择结果解析 AWS 凭证：有 session token 时使用 STS 会话凭证，否则使用基本凭证。
      */
-    private software.amazon.awssdk.auth.credentials.AwsCredentials resolveCredentials() {
-        String token = props.sessionToken();
+    private software.amazon.awssdk.auth.credentials.AwsCredentials resolveCredentials(
+            UpstreamAccountSelector.AwsSelection account) {
+        String token = account.sessionToken();
         if (token != null && !token.isBlank()) {
-            return AwsSessionCredentials.create(props.accessKey(), props.secretKey(), token);
+            return AwsSessionCredentials.create(account.accessKey(), account.secretKey(), token);
         }
-        return AwsBasicCredentials.create(props.accessKey(), props.secretKey());
+        return AwsBasicCredentials.create(account.accessKey(), account.secretKey());
     }
 
     /**
@@ -151,8 +150,10 @@ public class BedrockProxyHandler {
                                                   AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                   String username, String model, String traceId) {
 
-        // 确定使用的 AWS 区域：优先使用映射配置，否则用默认配置
-        String region = mapping.region() != null ? mapping.region() : props.region();
+        UpstreamAccountSelector.AwsSelection account = UpstreamAccountSelector.selectAws(mapping, props);
+        // 区域优先级：账号覆盖 > 模型映射 > 全局 bedrock.region
+        String region = account.regionOverride() != null ? account.regionOverride()
+                : (mapping.region() != null ? mapping.region() : props.region());
 
         // Anthropic 格式转换器（仅当 response-format=anthropic 时创建，惰性初始化）
         boolean useAnthropic = "anthropic".equalsIgnoreCase(props.responseFormat());
@@ -167,9 +168,8 @@ public class BedrockProxyHandler {
         // 使用 Flux.push 桥接 Bedrock 异步回调到 Reactor Flux
         // Flux.push 内部处理跨线程 emit 的序列化，比 Sinks.Many 更适合回调场景
         return Flux.<ServerSentEvent<String>>push(emitter -> {
-                    // 按区域获取或创建 BedrockAsyncClient
-                    BedrockRuntimeAsyncClient client = clients.computeIfAbsent(region,
-                            k -> buildBedrockClientForRegion(k));
+                    // 按区域 + 账号获取或创建 BedrockAsyncClient
+                    BedrockRuntimeAsyncClient client = getBedrockClient(region, account);
 
                     try {
                         // 去掉 model 字段后，规范化 metadata，避免上游 user_id 等违反 Bedrock 正则导致 400
