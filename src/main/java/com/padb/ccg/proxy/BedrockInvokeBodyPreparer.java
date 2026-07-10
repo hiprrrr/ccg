@@ -153,22 +153,50 @@ public final class BedrockInvokeBodyPreparer {
                     && content != null && content.isArray() && hasBlockType(content, "tool_use")) {
                 appendAssistantToolUseMessage(root, normalized, content);
             } else {
-                ObjectNode out = root.objectNode();
-                out.put("role", role);
-                // 含图片块的 content：保留为 OpenAI 多模态 content 数组（image → image_url）
-                // 纯文本：保持原有拍平为字符串的行为，避免对存量请求有任何改动
-                if (content != null && content.isArray() && hasBlockType(content, "image")) {
-                    out.set("content", contentToOpenAiArray(root, content));
-                } else {
-                    String text = contentToText(content);
-                    out.put("content", text);
-                }
-                normalized.add(out);
+                appendPassthroughOpenAiMessage(root, normalized, (ObjectNode) message);
             }
         }
 
+        sanitizeOpenAiMessages(normalized);
         root.set("messages", normalized);
         root.remove("system");
+    }
+
+    /**
+     * 透传已是 OpenAI Chat 形态的 message，保留 {@code tool_call_id}、{@code tool_calls} 等 Bedrock 必填字段。
+     * 通用 else 分支若只拷贝 role/content，会把 {@code role:tool} 的 {@code tool_call_id} 丢掉并触发 400。
+     */
+    private static void appendPassthroughOpenAiMessage(ObjectNode root, ArrayNode normalized, ObjectNode message) {
+        String role = message.path("role").asText();
+        JsonNode content = message.get("content");
+        ObjectNode out = root.objectNode();
+        out.put("role", role);
+        if (content != null && content.isArray() && hasBlockType(content, "image")) {
+            out.set("content", contentToOpenAiArray(root, content));
+        } else {
+            String text = contentToText(content);
+            out.put("content", text);
+        }
+        if ("tool".equals(role)) {
+            copyTextFieldIfPresent(message, out, "tool_call_id");
+        } else if ("assistant".equals(role)) {
+            JsonNode toolCalls = message.get("tool_calls");
+            if (toolCalls != null && toolCalls.isArray() && !toolCalls.isEmpty()) {
+                out.set("tool_calls", toolCalls.deepCopy());
+                if (isBlankContent(out.get("content"))) {
+                    out.remove("content");
+                }
+            }
+        }
+        normalized.add(out);
+    }
+
+    /** 将源对象上的字符串字段复制到目标（仅当非空白时写入）。 */
+    private static void copyTextFieldIfPresent(ObjectNode from, ObjectNode to, String field) {
+        String value = from.path(field).asText("");
+        if (!value.isBlank()) {
+            to.put(field, value);
+        }
     }
 
     /** 当前模型不支持工具时，移除工具声明与工具选择，避免辅助模型卡在 unsupported tool schema。 */
@@ -187,6 +215,13 @@ public final class BedrockInvokeBodyPreparer {
             if ("text".equals(type)) {
                 appendText(userText, block.path("text").asText());
             } else if ("tool_result".equals(type)) {
+                String toolCallId = resolveToolCallId(block);
+                String resultText = contentToText(block.get("content"));
+                if (toolCallId.isBlank()) {
+                    // 无法关联 assistant.tool_calls 时降级为 user 文本，避免 Bedrock 400
+                    appendText(userText, resultText);
+                    continue;
+                }
                 if (userText.length() > 0) {
                     ObjectNode userMsg = root.objectNode();
                     userMsg.put("role", "user");
@@ -196,8 +231,8 @@ public final class BedrockInvokeBodyPreparer {
                 }
                 ObjectNode toolMsg = root.objectNode();
                 toolMsg.put("role", "tool");
-                toolMsg.put("tool_call_id", block.path("tool_use_id").asText());
-                toolMsg.put("content", contentToText(block.get("content")));
+                toolMsg.put("tool_call_id", toolCallId);
+                toolMsg.put("content", blankContentAsSpace(resultText));
                 normalized.add(toolMsg);
             }
         }
@@ -207,6 +242,75 @@ public final class BedrockInvokeBodyPreparer {
             userMsg.put("content", userText.toString());
             normalized.add(userMsg);
         }
+    }
+
+    /**
+     * 从 Anthropic {@code tool_result} 块解析 OpenAI {@code tool_call_id}。
+     * 依次尝试 {@code tool_use_id}、{@code tool_call_id}、{@code id}，兼容不同客户端字段命名。
+     */
+    private static String resolveToolCallId(JsonNode toolResultBlock) {
+        for (String field : List.of("tool_use_id", "tool_call_id", "id")) {
+            String value = toolResultBlock.path(field).asText("");
+            if (!value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    /** OpenAI tool 消息要求 content 非空；空白结果用单空格占位。 */
+    private static String blankContentAsSpace(String content) {
+        return content == null || content.isBlank() ? " " : content;
+    }
+
+    /**
+     * 清理 OpenAI messages：去掉缺 {@code tool_call_id} 的 tool 消息、空 user/system，
+     * assistant 仅有 tool_calls 时移除空 content。
+     */
+    private static void sanitizeOpenAiMessages(ArrayNode messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            JsonNode msg = messages.get(i);
+            if (!(msg instanceof ObjectNode obj)) {
+                messages.remove(i);
+                continue;
+            }
+            String role = obj.path("role").asText();
+            boolean hasToolCalls = obj.has("tool_calls")
+                    && obj.get("tool_calls").isArray()
+                    && !obj.get("tool_calls").isEmpty();
+
+            if ("assistant".equals(role)) {
+                if (hasToolCalls && isBlankContent(obj.get("content"))) {
+                    obj.remove("content");
+                } else if (!hasToolCalls && isBlankContent(obj.get("content"))) {
+                    messages.remove(i);
+                }
+            } else if ("user".equals(role) || "system".equals(role)) {
+                if (isBlankContent(obj.get("content"))) {
+                    messages.remove(i);
+                }
+            } else if ("tool".equals(role)) {
+                if (obj.path("tool_call_id").asText("").isBlank()) {
+                    messages.remove(i);
+                } else if (isBlankContent(obj.get("content"))) {
+                    obj.put("content", " ");
+                }
+            }
+        }
+    }
+
+    /** 判断 OpenAI message content 是否为空（null、空白字符串或空数组）。 */
+    private static boolean isBlankContent(JsonNode content) {
+        if (content == null || content.isNull()) {
+            return true;
+        }
+        if (content.isTextual()) {
+            return content.asText().isBlank();
+        }
+        if (content.isArray()) {
+            return content.isEmpty();
+        }
+        return false;
     }
 
     /** 将 Anthropic assistant tool_use content block 转为 OpenAI assistant.tool_calls。 */

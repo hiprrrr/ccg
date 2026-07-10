@@ -138,6 +138,46 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
+    void normalizeMetadata_preservesOpenAiToolMessageToolCallId() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"assistant","content":"","tool_calls":[{"id":"call_9","type":"function",
+                    "function":{"name":"Read","arguments":"{}"}}]},
+                  {"role":"tool","tool_call_id":"call_9","content":"file contents"}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        assertThat(out).contains("\"role\":\"tool\"");
+        assertThat(out).contains("\"tool_call_id\":\"call_9\"");
+        assertThat(out).contains("\"tool_calls\"");
+    }
+
+    @Test
+    void normalizeMetadata_resolvesToolCallIdFromAlternateFields() throws Exception {
+        String in = """
+                {"messages":[
+                  {"role":"assistant","content":[{"type":"tool_use","id":"call_alt","name":"Read","input":{}}]},
+                  {"role":"user","content":[{"type":"tool_result","tool_call_id":"call_alt","content":"ok"}]}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        assertThat(out).contains("\"role\":\"tool\",\"tool_call_id\":\"call_alt\",\"content\":\"ok\"");
+    }
+
+    @Test
+    void normalizeMetadata_dropsToolMessageWithoutToolCallId() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"user","content":"hi"},
+                  {"role":"tool","content":"orphan result"}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        assertThat(out).doesNotContain("\"role\":\"tool\"");
+        assertThat(out).contains("\"role\":\"user\",\"content\":\"hi\"");
+    }
+
+    @Test
     void normalizeMetadata_stripsExperimentalAnthropicExtensionsForOpenAiShapeModels() throws Exception {
         String in = """
                 {"anthropic_version":"2023-06-01","anthropic_beta":["tool-search-tool-2025-10-19"],
