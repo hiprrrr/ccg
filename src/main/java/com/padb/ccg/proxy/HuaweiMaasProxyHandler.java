@@ -92,13 +92,13 @@ public class HuaweiMaasProxyHandler {
             return Flux.error(new ProviderException("Invalid OpenAI request for Huawei MaaS: " + e.getMessage()));
         }
 
-        log.info("Huawei MaaS OpenAI passthrough: traceId={} user={} userModel={} upstreamModel={} account={} streaming={}",
-                correlationId, username, model, mapping.upstreamModelId(), account.accountId(), streaming);
+        log.info("Huawei MaaS OpenAI passthrough: traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                correlationId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeOpenAiStreaming(body, account.apiKey(), inputTokens, outputTokens, correlationId, username, model, false);
+            return invokeOpenAiStreaming(body, account, inputTokens, outputTokens, correlationId, username, model, false);
         }
-        return invokeOpenAiNonStreamingAsSingleEvent(body, account.apiKey(), inputTokens, outputTokens, correlationId, username, model);
+        return invokeOpenAiNonStreamingAsSingleEvent(body, account, inputTokens, outputTokens, correlationId, username, model);
     }
 
     private Flux<ServerSentEvent<String>> forwardAnthropicUpstream(ProviderConfig mapping, String requestBody,
@@ -113,13 +113,13 @@ public class HuaweiMaasProxyHandler {
             return Flux.error(new ProviderException("Invalid request body for Huawei MaaS: " + e.getMessage()));
         }
 
-        log.info("Huawei MaaS Anthropic upstream: traceId={} user={} userModel={} upstreamModel={} account={} streaming={}",
-                traceId, username, model, mapping.upstreamModelId(), account.accountId(), streaming);
+        log.info("Huawei MaaS Anthropic upstream: traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                traceId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeAnthropicStreaming(body, account.apiKey(), inputTokens, outputTokens, traceId, username, model);
+            return invokeAnthropicStreaming(body, account, inputTokens, outputTokens, traceId, username, model);
         }
-        return invokeAnthropicNonStreaming(body, account.apiKey(), model, inputTokens, outputTokens, traceId, username);
+        return invokeAnthropicNonStreaming(body, account, model, inputTokens, outputTokens, traceId, username);
     }
 
     private Flux<ServerSentEvent<String>> forwardAnthropicViaOpenAiUpstream(ProviderConfig mapping, String requestBody,
@@ -137,22 +137,23 @@ public class HuaweiMaasProxyHandler {
                     + e.getMessage()));
         }
 
-        log.info("Huawei MaaS OpenAI upstream (Anthropic client): traceId={} user={} userModel={} upstreamModel={} account={} streaming={}",
-                traceId, username, model, mapping.upstreamModelId(), account.accountId(), streaming);
+        log.info("Huawei MaaS OpenAI upstream (Anthropic client): traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                traceId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeOpenAiStreaming(openAiBody, account.apiKey(), inputTokens, outputTokens, traceId, username, model, true);
+            return invokeOpenAiStreaming(openAiBody, account, inputTokens, outputTokens, traceId, username, model, true);
         }
-        return invokeOpenAiNonStreamingAsAnthropicSse(openAiBody, account.apiKey(), model, inputTokens, outputTokens, traceId, username);
+        return invokeOpenAiNonStreamingAsAnthropicSse(openAiBody, account, model, inputTokens, outputTokens, traceId, username);
     }
 
-    private Flux<ServerSentEvent<String>> invokeAnthropicStreaming(String body, String apiKey,
+    private Flux<ServerSentEvent<String>> invokeAnthropicStreaming(String body,
+                                                                    UpstreamAccountSelector.HuaweiSelection account,
                                                                     AtomicInteger inputTokens,
                                                                     AtomicInteger outputTokens,
                                                                     String traceId, String username, String userModel) {
         return webClient.post()
                 .uri("/v1/messages")
-                .header("x-api-key", apiKey)
+                .header("x-api-key", account.apiKey())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .bodyValue(body)
@@ -166,13 +167,15 @@ public class HuaweiMaasProxyHandler {
                         traceId, username, userModel, e));
     }
 
-    private Flux<ServerSentEvent<String>> invokeAnthropicNonStreaming(String body, String apiKey, String userModel,
+    private Flux<ServerSentEvent<String>> invokeAnthropicNonStreaming(String body,
+                                                                       UpstreamAccountSelector.HuaweiSelection account,
+                                                                       String userModel,
                                                                        AtomicInteger inputTokens,
                                                                        AtomicInteger outputTokens,
                                                                        String traceId, String username) {
         return webClient.post()
                 .uri("/v1/messages")
-                .header("x-api-key", apiKey)
+                .header("x-api-key", account.apiKey())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
@@ -196,7 +199,8 @@ public class HuaweiMaasProxyHandler {
     /**
      * @param convertToAnthropic 为 true 时将 OpenAI SSE chunk 转为 Anthropic SSE（Anthropic 客户端走 OpenAI 上游）
      */
-    private Flux<ServerSentEvent<String>> invokeOpenAiStreaming(String body, String apiKey,
+    private Flux<ServerSentEvent<String>> invokeOpenAiStreaming(String body,
+                                                                 UpstreamAccountSelector.HuaweiSelection account,
                                                                  AtomicInteger inputTokens,
                                                                  AtomicInteger outputTokens,
                                                                  String traceId, String username, String userModel,
@@ -205,7 +209,7 @@ public class HuaweiMaasProxyHandler {
 
         return webClient.post()
                 .uri("/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .bodyValue(body)
                 .retrieve()
@@ -246,14 +250,15 @@ public class HuaweiMaasProxyHandler {
                         traceId, username, userModel, e));
     }
 
-    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsAnthropicSse(String body, String apiKey,
+    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsAnthropicSse(String body,
+                                                                                  UpstreamAccountSelector.HuaweiSelection account,
                                                                                   String userModel,
                                                                                   AtomicInteger inputTokens,
                                                                                   AtomicInteger outputTokens,
                                                                                   String traceId, String username) {
         return webClient.post()
                 .uri("/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
@@ -275,14 +280,15 @@ public class HuaweiMaasProxyHandler {
                 });
     }
 
-    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsSingleEvent(String body, String apiKey,
+    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsSingleEvent(String body,
+                                                                                 UpstreamAccountSelector.HuaweiSelection account,
                                                                                  AtomicInteger inputTokens,
                                                                                  AtomicInteger outputTokens,
                                                                                  String traceId, String username,
                                                                                  String userModel) {
         return webClient.post()
                 .uri("/chat/completions")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()

@@ -11,7 +11,7 @@ import java.util.List;
  * @param upstreamModelId  上游模型 ID（Bedrock modelId 或华为 MaaS model 参数）
  * @param region           AWS 区域（仅 AWS 渠道使用，华为云可为 null）
  * @param capabilities     模型能力列表（如 vision、tools、stream 等）
- * @param accounts         上游多账号池（随机分流）；为空则使用全局 huawei-maas / bedrock 凭证
+ * @param accounts         华为 MaaS 多 Key 池（随机分流）；为空则使用全局 huawei-maas.api-key
  */
 public record ProviderConfig(ProviderChannel provider, String modelName, String upstreamModelId,
                               String region, List<String> capabilities, List<ProviderAccount> accounts) {

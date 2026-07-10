@@ -58,8 +58,14 @@ spring:
 # AWS Bedrock 模型代理配置
 # ============================================================================
 bedrock:
-  # AWS 区域：模型未单独指定 region / accounts.region 时的默认值
+  # AWS 区域：模型未单独指定 region 时的默认值
   region: ${BEDROCK_REGION:us-east-1}
+  # AWS 访问密钥：用于认证 Bedrock API 调用；未配置时走 IRSA / 默认凭证链
+  # 优先 BEDROCK_ACCESS_KEY（K8s Secret / Apollo），其次标准 AWS_ACCESS_KEY_ID
+  access-key: ${BEDROCK_ACCESS_KEY:${AWS_ACCESS_KEY_ID:}}
+  secret-key: ${BEDROCK_SECRET_KEY:${AWS_SECRET_ACCESS_KEY:}}
+  # STS 临时凭证（ASIA 开头 access key）必填
+  session-token: ${BEDROCK_SESSION_TOKEN:${AWS_SESSION_TOKEN:}}
   # 响应格式转换策略：
   # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
   # - passthrough: 直接透传 Bedrock 原始响应，不做转换
@@ -93,6 +99,7 @@ huawei-maas:
   api-format: ${HUAWEI_MAAS_API_FORMAT:openai}
   # 未配置时按 api-format 使用默认域名；也可显式覆盖
   base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/openai/v1}
+  api-key: ${HUAWEI_MAAS_API_KEY:}
   retry-max: 3
   timeout-seconds: 300
 
@@ -108,20 +115,6 @@ model-mappings:
       - text
       - tools
       - stream
-    # 多账号随机分流：每次请求随机选一个 AWS 凭证，降低单账号限流风险
-    accounts:
-      - id: aws-1
-        access-key: ${BEDROCK_ACCESS_KEY_1:}
-        secret-key: ${BEDROCK_SECRET_KEY_1:}
-        session-token: ${BEDROCK_SESSION_TOKEN_1:}
-      - id: aws-2
-        access-key: ${BEDROCK_ACCESS_KEY_2:}
-        secret-key: ${BEDROCK_SECRET_KEY_2:}
-        session-token: ${BEDROCK_SESSION_TOKEN_2:}
-      - id: aws-3
-        access-key: ${BEDROCK_ACCESS_KEY_3:}
-        secret-key: ${BEDROCK_SECRET_KEY_3:}
-        session-token: ${BEDROCK_SESSION_TOKEN_3:}
 
   - model-name: glm-5.2
     provider: huawei

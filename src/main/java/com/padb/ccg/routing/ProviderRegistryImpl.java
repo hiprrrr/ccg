@@ -1,5 +1,7 @@
 package com.padb.ccg.routing;
 
+import com.padb.ccg.core.model.ProviderAccount;
+import com.padb.ccg.core.model.ProviderChannel;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.spi.ProviderRegistry;
 import com.padb.ccg.proxy.ModelMappingsProperties;
@@ -60,6 +62,7 @@ public class ProviderRegistryImpl implements ProviderRegistry {
                         c.modelName(), existing.provider(), existing.upstreamModelId(),
                         c.provider(), c.upstreamModelId());
             }
+            warnHuaweiAccountsWithEmptyKeys(c);
         }
         modelMap.set(Collections.unmodifiableMap(newMap));
         long awsCount = newMap.values().stream().filter(c -> c.provider() == com.padb.ccg.core.model.ProviderChannel.AWS).count();
@@ -70,5 +73,25 @@ public class ProviderRegistryImpl implements ProviderRegistry {
     /** 获取当前注册的模型数量 */
     public int modelCount() {
         return modelMap.get().size();
+    }
+
+    /**
+     * 华为模型若配置了 accounts 但部分 api-key 为空，启动/热更新时告警，避免误以为在均匀分流。
+     */
+    private static void warnHuaweiAccountsWithEmptyKeys(ProviderConfig config) {
+        if (config.provider() != ProviderChannel.HUAWEI || !config.hasAccounts()) {
+            return;
+        }
+        List<ProviderAccount> accounts = config.accounts();
+        long validCount = accounts.stream().filter(ProviderAccount::hasApiKey).count();
+        if (validCount < accounts.size()) {
+            List<String> skippedIds = accounts.stream()
+                    .filter(a -> !a.hasApiKey())
+                    .map(a -> a.resolvedId("?"))
+                    .toList();
+            log.warn("Model '{}' huawei accounts: {} configured, {} with api-key; skipped ids={} — "
+                            + "empty keys are excluded from random pool",
+                    config.modelName(), accounts.size(), validCount, skippedIds);
+        }
     }
 }
