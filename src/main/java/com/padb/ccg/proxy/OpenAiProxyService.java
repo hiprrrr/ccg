@@ -1,6 +1,5 @@
 package com.padb.ccg.proxy;
 
-import com.padb.ccg.core.model.ProviderChannel;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.model.RequestLogEntry;
 import com.padb.ccg.core.spi.RateLimiter;
@@ -48,20 +47,20 @@ public class OpenAiProxyService {
     private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
     private final LlmUpstreamRouter upstreamRouter;
-    private final HuaweiMaasProperties huaweiMaasProperties;
+    private final OtherProvidersRegistry otherProvidersRegistry;
     private final RequestLogger requestLogger;
     private final ObjectMapper objectMapper;
 
     public OpenAiProxyService(AuthService authService, RateLimiter rateLimiter,
                               ProviderRegistryImpl providerRegistry,
-                              LlmUpstreamRouter upstreamRouter, HuaweiMaasProperties huaweiMaasProperties,
+                              LlmUpstreamRouter upstreamRouter, OtherProvidersRegistry otherProvidersRegistry,
                               RequestLogger requestLogger,
                               ObjectMapper objectMapper) {
         this.authService = authService;
         this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
         this.upstreamRouter = upstreamRouter;
-        this.huaweiMaasProperties = huaweiMaasProperties;
+        this.otherProvidersRegistry = otherProvidersRegistry;
         this.requestLogger = requestLogger;
         this.objectMapper = objectMapper;
     }
@@ -99,10 +98,10 @@ public class OpenAiProxyService {
                         return respondOpenAiError(404, "model_not_found", "Model '" + model + "' not found");
                     }
                     var mapping = mappingOpt.get();
-                    boolean huaweiOpenAiPassthrough = isHuaweiOpenAiPassthrough(mapping);
+                    boolean openAiPassthrough = isOpenAiPassthrough(mapping);
 
                     final String bodyToForward;
-                    if (huaweiOpenAiPassthrough) {
+                    if (openAiPassthrough) {
                         bodyToForward = body;
                     } else {
                         String convertedBody = convertRequestBody(body);
@@ -136,12 +135,12 @@ public class OpenAiProxyService {
                                         .thenReturn(personId);
                             })
                             .flatMap(personId -> {
-                                if (huaweiOpenAiPassthrough) {
+                                if (openAiPassthrough) {
                                     if (streamRequested) {
-                                        return handleHuaweiOpenAiStreamingRequest(mapping, bodyToForward, personId,
+                                        return handleOpenAiPassthroughStreamingRequest(mapping, bodyToForward, personId,
                                                 model, requestId, inputTokens, outputTokens, errorRef, start);
                                     }
-                                    return handleHuaweiOpenAiNonStreamingRequest(mapping, bodyToForward, personId,
+                                    return handleOpenAiPassthroughNonStreamingRequest(mapping, bodyToForward, personId,
                                             model, requestId, inputTokens, outputTokens, start);
                                 }
                                 if (streamRequested) {
@@ -383,15 +382,20 @@ public class OpenAiProxyService {
                 }));
     }
 
-    /** 华为 MaaS 配置为 OpenAI 上游时，{@code /v1/chat/completions} 可透传 OpenAI 协议。 */
-    private boolean isHuaweiOpenAiPassthrough(ProviderConfig mapping) {
-        return mapping.provider() == ProviderChannel.HUAWEI && huaweiMaasProperties.isOpenAiFormat();
+    /** other-providers 显式 openai 或未配置 api-format 时，OpenAI 客户端可透传上游协议。 */
+    private boolean isOpenAiPassthrough(ProviderConfig mapping) {
+        if (mapping.isAws()) {
+            return false;
+        }
+        return otherProvidersRegistry.find(mapping.provider())
+                .map(OtherProviderItem::supportsOpenAiClientPassthrough)
+                .orElse(false);
     }
 
     /**
-     * 华为 OpenAI 上游流式透传：不经 Anthropic 中转，直接转发 OpenAI SSE。
+     * OpenAI 上游流式透传：不经 Anthropic 中转，直接转发 OpenAI SSE。
      */
-    private Mono<ServerResponse> handleHuaweiOpenAiStreamingRequest(ProviderConfig mapping, String body,
+    private Mono<ServerResponse> handleOpenAiPassthroughStreamingRequest(ProviderConfig mapping, String body,
                                                                      String personId, String model, String requestId,
                                                                      AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                                      AtomicReference<String> errorRef, Instant start) {
@@ -414,16 +418,16 @@ public class OpenAiProxyService {
                 .doFinally(signal -> {
                     switch (signal) {
                         case ON_COMPLETE -> {
-                            log.info("Huawei OpenAI SSE passthrough completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                    requestId, personId, model,
+                            log.info("OpenAI SSE passthrough completed: id={} personId={} model={} provider={} durationMs={} inputTokens={} outputTokens={}",
+                                    requestId, personId, model, mapping.provider(),
                                     Duration.between(start, Instant.now()).toMillis(),
                                     inputTokens.get(), outputTokens.get());
                             logRequest(personId, mapping, true, null,
                                     inputTokens.get(), outputTokens.get(), start);
                         }
                         case ON_ERROR -> {
-                            log.warn("Huawei OpenAI SSE passthrough errored: id={} personId={} model={} error={}",
-                                    requestId, personId, model, errorRef.get());
+                            log.warn("OpenAI SSE passthrough errored: id={} personId={} model={} provider={} error={}",
+                                    requestId, personId, model, mapping.provider(), errorRef.get());
                             logRequest(personId, mapping, false, errorRef.get(),
                                     inputTokens.get(), outputTokens.get(), start);
                         }
@@ -440,9 +444,9 @@ public class OpenAiProxyService {
     }
 
     /**
-     * 华为 OpenAI 上游非流式透传：直接返回上游 JSON 响应。
+     * OpenAI 上游非流式透传：直接返回上游 JSON 响应。
      */
-    private Mono<ServerResponse> handleHuaweiOpenAiNonStreamingRequest(ProviderConfig mapping, String body,
+    private Mono<ServerResponse> handleOpenAiPassthroughNonStreamingRequest(ProviderConfig mapping, String body,
                                                                           String personId, String model,
                                                                           String requestId,
                                                                           AtomicInteger inputTokens,
@@ -452,10 +456,10 @@ public class OpenAiProxyService {
                 .flatMap(event -> {
                     String json = event.data();
                     if (json == null || json.isBlank()) {
-                        return respondOpenAiError(502, "api_error", "Empty response from Huawei MaaS");
+                        return respondOpenAiError(502, "api_error", "Empty response from upstream provider");
                     }
-                    log.info("Huawei OpenAI non-stream passthrough completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                            requestId, personId, model,
+                    log.info("OpenAI non-stream passthrough completed: id={} personId={} model={} provider={} durationMs={} inputTokens={} outputTokens={}",
+                            requestId, personId, model, mapping.provider(),
                             Duration.between(start, Instant.now()).toMillis(),
                             inputTokens.get(), outputTokens.get());
                     logRequest(personId, mapping, true, null,

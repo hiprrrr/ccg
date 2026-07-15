@@ -28,27 +28,28 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 华为云 MaaS 代理：支持 Anthropic（{@code /v1/messages}）与 OpenAI（{@code /chat/completions}）两种上游协议。
- * 对网关 {@link com.padb.ccg.proxy.ProxyService} 统一输出 Anthropic SSE；对 OpenAI 客户端可透传 OpenAI SSE。
+ * HTTP 透传代理：按 {@code other-providers} 配置替换 base-url 与 api-key。
+ * {@code api-format} 可选：{@code anthropic} / {@code openai}；未配置则按客户端协议透传，不做格式互转。
  */
 @Component
-public class HuaweiMaasProxyHandler {
+public class HttpPassthroughProxyHandler {
 
-    private static final Logger log = LoggerFactory.getLogger(HuaweiMaasProxyHandler.class);
+    private static final Logger log = LoggerFactory.getLogger(HttpPassthroughProxyHandler.class);
     private static final String ANTHROPIC_VERSION = "2023-06-01";
 
-    private final HuaweiMaasProperties props;
+    private final OtherProvidersRegistry otherProvidersRegistry;
     private final ObjectMapper objectMapper;
     private final WebClient webClient;
 
-    public HuaweiMaasProxyHandler(HuaweiMaasProperties props, ObjectMapper objectMapper, WebClient.Builder builder) {
-        this.props = props;
+    public HttpPassthroughProxyHandler(OtherProvidersRegistry otherProvidersRegistry,
+                                       UpstreamProperties upstreamProperties,
+                                       ObjectMapper objectMapper, WebClient.Builder builder) {
+        this.otherProvidersRegistry = otherProvidersRegistry;
         this.objectMapper = objectMapper;
-        Duration timeout = Duration.ofSeconds(Math.max(1, props.timeoutSeconds()));
+        Duration timeout = Duration.ofSeconds(Math.max(1, upstreamProperties.timeoutSeconds()));
         HttpClient httpClient = HttpClient.create().responseTimeout(timeout);
         this.webClient = builder
                 .clientConnector(new ReactorClientHttpConnector(httpClient))
-                .baseUrl(props.resolvedBaseUrl())
                 .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .build();
     }
@@ -59,139 +60,169 @@ public class HuaweiMaasProxyHandler {
     public Flux<ServerSentEvent<String>> forward(ProviderConfig mapping, String requestBody,
                                                   AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                   String username, String model, String traceId) {
-        UpstreamAccountSelector.HuaweiSelection account = UpstreamAccountSelector.selectHuawei(mapping, props);
+        OtherProviderItem provider = otherProvidersRegistry.require(mapping.provider());
+        UpstreamAccountSelector.AccountSelection account = UpstreamAccountSelector.select(provider);
         final String correlationId = normalizeTraceId(traceId);
-        boolean streaming = supportsStreaming(mapping);
+        // 优先尊重请求体 stream；未声明时再回退到 capabilities 中的 stream/streaming
+        boolean streaming = resolveStreaming(mapping, requestBody);
 
-        if (props.isOpenAiFormat()) {
-            return forwardAnthropicViaOpenAiUpstream(mapping, requestBody, inputTokens, outputTokens,
+        // 仅显式 api-format=openai 时，将 Anthropic 客户端请求转到 OpenAI 上游并做协议转换；
+        // anthropic 或未配置（透传）则按 Anthropic 协议直连上游。
+        if (provider.isOpenAiFormat()) {
+            return forwardAnthropicViaOpenAiUpstream(provider, mapping, requestBody, inputTokens, outputTokens,
                     username, model, correlationId, streaming, account);
         }
-        return forwardAnthropicUpstream(mapping, requestBody, inputTokens, outputTokens,
+        return forwardAnthropicUpstream(provider, mapping, requestBody, inputTokens, outputTokens,
                 username, model, correlationId, streaming, account);
     }
 
     /**
-     * 透传 OpenAI Chat Completions 请求/响应（仅 {@code api-format=openai} 时可用）。
+     * 透传 OpenAI Chat Completions（api-format=openai，或未配置 api-format 的透传模式）。
      */
     public Flux<ServerSentEvent<String>> forwardOpenAi(ProviderConfig mapping, String openAiBody,
                                                         AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                         String username, String model, String traceId) {
-        if (!props.isOpenAiFormat()) {
+        OtherProviderItem provider = otherProvidersRegistry.require(mapping.provider());
+        if (!provider.supportsOpenAiClientPassthrough()) {
             return Flux.error(new ProviderException(
-                    "Huawei MaaS OpenAI passthrough requires huawei-maas.api-format=openai"));
+                    "OpenAI client passthrough requires api-format=openai or omit api-format for provider '"
+                            + provider.name() + "' (current=" + provider.resolvedApiFormat() + ")"));
         }
 
-        UpstreamAccountSelector.HuaweiSelection account = UpstreamAccountSelector.selectHuawei(mapping, props);
+        UpstreamAccountSelector.AccountSelection account = UpstreamAccountSelector.select(provider);
         final String correlationId = normalizeTraceId(traceId);
         boolean streaming = isStreamRequested(openAiBody);
         String body;
         try {
             body = prepareOpenAiRequestBody(openAiBody, mapping.upstreamModelId(), streaming);
         } catch (JsonProcessingException e) {
-            return Flux.error(new ProviderException("Invalid OpenAI request for Huawei MaaS: " + e.getMessage()));
+            return Flux.error(new ProviderException("Invalid OpenAI request for provider '"
+                    + provider.name() + "': " + e.getMessage()));
         }
 
-        log.info("Huawei MaaS OpenAI passthrough: traceId={} user={} userModel={} upstreamModel={} streaming={}",
-                correlationId, username, model, mapping.upstreamModelId(), streaming);
+        log.info("HTTP passthrough OpenAI: provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                provider.name(), correlationId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeOpenAiStreaming(body, account, inputTokens, outputTokens, correlationId, username, model, false);
+            return invokeOpenAiStreaming(provider, body, account, inputTokens, outputTokens,
+                    correlationId, username, model, false);
         }
-        return invokeOpenAiNonStreamingAsSingleEvent(body, account, inputTokens, outputTokens, correlationId, username, model);
+        return invokeOpenAiNonStreamingAsSingleEvent(provider, body, account, inputTokens, outputTokens,
+                correlationId, username, model);
     }
 
-    private Flux<ServerSentEvent<String>> forwardAnthropicUpstream(ProviderConfig mapping, String requestBody,
+    private Flux<ServerSentEvent<String>> forwardAnthropicUpstream(OtherProviderItem provider,
+                                                                   ProviderConfig mapping, String requestBody,
                                                                    AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                                    String username, String model, String traceId,
                                                                    boolean streaming,
-                                                                   UpstreamAccountSelector.HuaweiSelection account) {
+                                                                   UpstreamAccountSelector.AccountSelection account) {
         String body;
         try {
             body = prepareAnthropicRequestBody(requestBody, mapping.upstreamModelId(), streaming);
         } catch (JsonProcessingException e) {
-            return Flux.error(new ProviderException("Invalid request body for Huawei MaaS: " + e.getMessage()));
+            return Flux.error(new ProviderException("Invalid request body for provider '"
+                    + provider.name() + "': " + e.getMessage()));
         }
 
-        log.info("Huawei MaaS Anthropic upstream: traceId={} user={} userModel={} upstreamModel={} streaming={}",
-                traceId, username, model, mapping.upstreamModelId(), streaming);
+        log.info("HTTP passthrough Anthropic: provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                provider.name(), traceId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeAnthropicStreaming(body, account, inputTokens, outputTokens, traceId, username, model);
+            return invokeAnthropicStreaming(provider, body, account, inputTokens, outputTokens, traceId, username, model);
         }
-        return invokeAnthropicNonStreaming(body, account, model, inputTokens, outputTokens, traceId, username);
+        return invokeAnthropicNonStreaming(provider, body, account, model, inputTokens, outputTokens, traceId, username);
     }
 
-    private Flux<ServerSentEvent<String>> forwardAnthropicViaOpenAiUpstream(ProviderConfig mapping, String requestBody,
+    private Flux<ServerSentEvent<String>> forwardAnthropicViaOpenAiUpstream(OtherProviderItem provider,
+                                                                             ProviderConfig mapping, String requestBody,
                                                                              AtomicInteger inputTokens,
                                                                              AtomicInteger outputTokens,
                                                                              String username, String model,
                                                                              String traceId, boolean streaming,
-                                                                             UpstreamAccountSelector.HuaweiSelection account) {
+                                                                             UpstreamAccountSelector.AccountSelection account) {
         String openAiBody;
         try {
             openAiBody = AnthropicOpenAiRequestConverter.toOpenAiChat(
                     objectMapper, requestBody, mapping.upstreamModelId(), streaming);
         } catch (JsonProcessingException e) {
-            return Flux.error(new ProviderException("Failed to convert Anthropic request for Huawei OpenAI API: "
-                    + e.getMessage()));
+            return Flux.error(new ProviderException("Failed to convert Anthropic request for provider '"
+                    + provider.name() + "' OpenAI API: " + e.getMessage()));
         }
 
-        log.info("Huawei MaaS OpenAI upstream (Anthropic client): traceId={} user={} userModel={} upstreamModel={} streaming={}",
-                traceId, username, model, mapping.upstreamModelId(), streaming);
+        log.info("HTTP passthrough OpenAI upstream (Anthropic client): provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
+                provider.name(), traceId, username, model, mapping.upstreamModelId(), streaming);
 
         if (streaming) {
-            return invokeOpenAiStreaming(openAiBody, account, inputTokens, outputTokens, traceId, username, model, true);
+            return invokeOpenAiStreaming(provider, openAiBody, account, inputTokens, outputTokens,
+                    traceId, username, model, true);
         }
-        return invokeOpenAiNonStreamingAsAnthropicSse(openAiBody, account, model, inputTokens, outputTokens, traceId, username);
+        return invokeOpenAiNonStreamingAsAnthropicSse(provider, openAiBody, account, model,
+                inputTokens, outputTokens, traceId, username);
     }
 
-    private Flux<ServerSentEvent<String>> invokeAnthropicStreaming(String body,
-                                                                    UpstreamAccountSelector.HuaweiSelection account,
+    private Flux<ServerSentEvent<String>> invokeAnthropicStreaming(OtherProviderItem provider, String body,
+                                                                    UpstreamAccountSelector.AccountSelection account,
                                                                     AtomicInteger inputTokens,
                                                                     AtomicInteger outputTokens,
                                                                     String traceId, String username, String userModel) {
+        AtomicInteger eventCount = new AtomicInteger(0);
         return webClient.post()
-                .uri("/v1/messages")
+                .uri(provider.resolvedBaseUrl() + "/v1/messages")
                 .header("x-api-key", account.apiKey())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .bodyValue(body)
-                .retrieve()
-                .onStatus(status -> status.isError(), this::toProviderError)
-                .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
-                .doOnNext(event -> accumulateUsageFromAnthropicSse(event.data(), inputTokens, outputTokens))
-                .doOnComplete(() -> log.info("Huawei MaaS Anthropic stream completed: traceId={} user={} model={}",
-                        traceId, username, userModel))
-                .doOnError(e -> log.error("Huawei MaaS Anthropic stream error: traceId={} user={} model={}",
-                        traceId, username, userModel, e));
+                .exchangeToFlux(response -> readAnthropicSseOrError(provider, response))
+                .map(this::normalizeAnthropicSseEvent)
+                .doOnNext(event -> {
+                    eventCount.incrementAndGet();
+                    accumulateUsageFromAnthropicSse(event.data(), inputTokens, outputTokens);
+                })
+                .switchIfEmpty(Flux.defer(() -> Flux.error(new ProviderException(
+                        "Provider '" + provider.name() + "' returned empty SSE stream"))))
+                .doOnComplete(() -> log.info(
+                        "HTTP passthrough Anthropic stream completed: provider={} traceId={} user={} model={} events={}",
+                        provider.name(), traceId, username, userModel, eventCount.get()))
+                .doOnError(e -> log.error("HTTP passthrough Anthropic stream error: provider={} traceId={} user={} model={}",
+                        provider.name(), traceId, username, userModel, e));
     }
 
-    private Flux<ServerSentEvent<String>> invokeAnthropicNonStreaming(String body,
-                                                                       UpstreamAccountSelector.HuaweiSelection account,
+    private Flux<ServerSentEvent<String>> invokeAnthropicNonStreaming(OtherProviderItem provider, String body,
+                                                                       UpstreamAccountSelector.AccountSelection account,
                                                                        String userModel,
                                                                        AtomicInteger inputTokens,
                                                                        AtomicInteger outputTokens,
                                                                        String traceId, String username) {
         return webClient.post()
-                .uri("/v1/messages")
+                .uri(provider.resolvedBaseUrl() + "/v1/messages")
                 .header("x-api-key", account.apiKey())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
-                .onStatus(status -> status.isError(), this::toProviderError)
+                .onStatus(status -> status.isError(), response -> toProviderError(provider, response))
                 .bodyToMono(String.class)
                 .flatMapMany(json -> {
                     try {
+                        if (json == null || json.isBlank()) {
+                            return Flux.error(new ProviderException(
+                                    "Provider '" + provider.name() + "' returned empty response body"));
+                        }
+                        // 部分供应商会用 HTTP 200 + error JSON 表示失败；不能当成功 SSE 回给 Claude Code
+                        if (looksLikeUpstreamErrorJson(json)) {
+                            return Flux.error(new ProviderException(
+                                    "Provider '" + provider.name() + "' returned error payload: " + truncateForLog(json)));
+                        }
                         accumulateUsageFromAnthropicMessage(json, inputTokens, outputTokens);
                         List<ServerSentEvent<String>> events = wrapAnthropicMessageAsSse(json, userModel);
-                        log.info("Huawei MaaS Anthropic non-stream completed: traceId={} user={} model={} events={}",
-                                traceId, username, userModel, events.size());
+                        log.info("HTTP passthrough Anthropic non-stream completed: provider={} traceId={} user={} model={} events={}",
+                                provider.name(), traceId, username, userModel, events.size());
                         return Flux.fromIterable(events);
                     } catch (JsonProcessingException e) {
                         return Flux.error(new ProviderException(
-                                "Failed to parse Huawei MaaS Anthropic response: " + e.getMessage()));
+                                "Failed to parse Anthropic response from provider '" + provider.name()
+                                        + "': " + e.getMessage()));
                     }
                 });
     }
@@ -199,22 +230,21 @@ public class HuaweiMaasProxyHandler {
     /**
      * @param convertToAnthropic 为 true 时将 OpenAI SSE chunk 转为 Anthropic SSE（Anthropic 客户端走 OpenAI 上游）
      */
-    private Flux<ServerSentEvent<String>> invokeOpenAiStreaming(String body,
-                                                                 UpstreamAccountSelector.HuaweiSelection account,
+    private Flux<ServerSentEvent<String>> invokeOpenAiStreaming(OtherProviderItem provider, String body,
+                                                                 UpstreamAccountSelector.AccountSelection account,
                                                                  AtomicInteger inputTokens,
                                                                  AtomicInteger outputTokens,
                                                                  String traceId, String username, String userModel,
                                                                  boolean convertToAnthropic) {
         AtomicReference<AnthropicSseConverter> converterRef = new AtomicReference<>();
+        AtomicInteger eventCount = new AtomicInteger(0);
 
         return webClient.post()
-                .uri("/chat/completions")
+                .uri(provider.resolvedBaseUrl() + "/chat/completions")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.TEXT_EVENT_STREAM)
                 .bodyValue(body)
-                .retrieve()
-                .onStatus(status -> status.isError(), this::toProviderError)
-                .bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {})
+                .exchangeToFlux(response -> readOpenAiSseOrError(provider, response))
                 .flatMap(event -> {
                     String data = event.data();
                     if (data == null || data.isBlank()) {
@@ -222,17 +252,21 @@ public class HuaweiMaasProxyHandler {
                     }
                     if ("[DONE]".equals(data.trim())) {
                         if (!convertToAnthropic) {
+                            eventCount.incrementAndGet();
                             return Flux.just(ServerSentEvent.<String>builder().data("[DONE]").build());
                         }
                         return Flux.empty();
                     }
                     accumulateUsageFromOpenAiSse(data, inputTokens, outputTokens);
                     if (!convertToAnthropic) {
+                        eventCount.incrementAndGet();
                         return Flux.just(ServerSentEvent.<String>builder().data(data).build());
                     }
                     AnthropicSseConverter converter = converterRef.updateAndGet(
                             c -> c != null ? c : new AnthropicSseConverter(objectMapper, userModel, traceId, false, 4096));
-                    return Flux.fromIterable(converter.convert(data));
+                    List<ServerSentEvent<String>> converted = converter.convert(data);
+                    eventCount.addAndGet(converted.size());
+                    return Flux.fromIterable(converted);
                 })
                 .concatWith(Flux.defer(() -> {
                     if (!convertToAnthropic) {
@@ -242,27 +276,32 @@ public class HuaweiMaasProxyHandler {
                     if (converter == null) {
                         return Flux.empty();
                     }
-                    return Flux.fromIterable(converter.endStreamIfOpen());
+                    List<ServerSentEvent<String>> tail = converter.endStreamIfOpen();
+                    eventCount.addAndGet(tail.size());
+                    return Flux.fromIterable(tail);
                 }))
-                .doOnComplete(() -> log.info("Huawei MaaS OpenAI stream completed: traceId={} user={} model={} anthropicOut={}",
-                        traceId, username, userModel, convertToAnthropic))
-                .doOnError(e -> log.error("Huawei MaaS OpenAI stream error: traceId={} user={} model={}",
-                        traceId, username, userModel, e));
+                .switchIfEmpty(Flux.defer(() -> Flux.error(new ProviderException(
+                        "Provider '" + provider.name() + "' returned empty OpenAI SSE stream"))))
+                .doOnComplete(() -> log.info(
+                        "HTTP passthrough OpenAI stream completed: provider={} traceId={} user={} model={} anthropicOut={} events={}",
+                        provider.name(), traceId, username, userModel, convertToAnthropic, eventCount.get()))
+                .doOnError(e -> log.error("HTTP passthrough OpenAI stream error: provider={} traceId={} user={} model={}",
+                        provider.name(), traceId, username, userModel, e));
     }
 
-    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsAnthropicSse(String body,
-                                                                                  UpstreamAccountSelector.HuaweiSelection account,
+    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsAnthropicSse(OtherProviderItem provider, String body,
+                                                                                  UpstreamAccountSelector.AccountSelection account,
                                                                                   String userModel,
                                                                                   AtomicInteger inputTokens,
                                                                                   AtomicInteger outputTokens,
                                                                                   String traceId, String username) {
         return webClient.post()
-                .uri("/chat/completions")
+                .uri(provider.resolvedBaseUrl() + "/chat/completions")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
-                .onStatus(status -> status.isError(), this::toProviderError)
+                .onStatus(status -> status.isError(), response -> toProviderError(provider, response))
                 .bodyToMono(String.class)
                 .flatMapMany(json -> {
                     try {
@@ -270,34 +309,35 @@ public class HuaweiMaasProxyHandler {
                         String anthropicJson = AnthropicOpenAiRequestConverter.toAnthropicMessage(
                                 objectMapper, json, userModel);
                         List<ServerSentEvent<String>> events = wrapAnthropicMessageAsSse(anthropicJson, userModel);
-                        log.info("Huawei MaaS OpenAI non-stream→Anthropic SSE: traceId={} user={} model={} events={}",
-                                traceId, username, userModel, events.size());
+                        log.info("HTTP passthrough OpenAI non-stream→Anthropic SSE: provider={} traceId={} user={} model={} events={}",
+                                provider.name(), traceId, username, userModel, events.size());
                         return Flux.fromIterable(events);
                     } catch (JsonProcessingException e) {
                         return Flux.error(new ProviderException(
-                                "Failed to parse Huawei MaaS OpenAI response: " + e.getMessage()));
+                                "Failed to parse OpenAI response from provider '" + provider.name()
+                                        + "': " + e.getMessage()));
                     }
                 });
     }
 
-    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsSingleEvent(String body,
-                                                                                 UpstreamAccountSelector.HuaweiSelection account,
+    private Flux<ServerSentEvent<String>> invokeOpenAiNonStreamingAsSingleEvent(OtherProviderItem provider, String body,
+                                                                                 UpstreamAccountSelector.AccountSelection account,
                                                                                  AtomicInteger inputTokens,
                                                                                  AtomicInteger outputTokens,
                                                                                  String traceId, String username,
                                                                                  String userModel) {
         return webClient.post()
-                .uri("/chat/completions")
+                .uri(provider.resolvedBaseUrl() + "/chat/completions")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + account.apiKey())
                 .accept(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
-                .onStatus(status -> status.isError(), this::toProviderError)
+                .onStatus(status -> status.isError(), response -> toProviderError(provider, response))
                 .bodyToMono(String.class)
                 .flatMapMany(json -> {
                     accumulateUsageFromOpenAiMessage(json, inputTokens, outputTokens);
-                    log.info("Huawei MaaS OpenAI non-stream completed: traceId={} user={} model={}",
-                            traceId, username, userModel);
+                    log.info("HTTP passthrough OpenAI non-stream completed: provider={} traceId={} user={} model={}",
+                            provider.name(), traceId, username, userModel);
                     return Flux.just(ServerSentEvent.<String>builder().data(json).build());
                 });
     }
@@ -326,15 +366,135 @@ public class HuaweiMaasProxyHandler {
         return objectMapper.writeValueAsString(root);
     }
 
-    private Mono<Throwable> toProviderError(org.springframework.web.reactive.function.client.ClientResponse response) {
+    private Mono<Throwable> toProviderError(OtherProviderItem provider,
+                                            org.springframework.web.reactive.function.client.ClientResponse response) {
         return response.bodyToMono(String.class)
-                .defaultIfEmpty("Huawei MaaS upstream error")
+                .defaultIfEmpty("upstream error")
                 .flatMap(msg -> Mono.error(new ProviderException(
-                        "Huawei MaaS error " + response.statusCode().value() + ": " + msg)));
+                        "Provider '" + provider.name() + "' error " + response.statusCode().value() + ": " + msg)));
+    }
+
+    /**
+     * 读取 Anthropic SSE；若上游以 HTTP 200 返回 JSON（常见限流/错误包装）则转为明确错误，避免 Claude Code 看到空 SSE。
+     */
+    private Flux<ServerSentEvent<String>> readAnthropicSseOrError(
+            OtherProviderItem provider,
+            org.springframework.web.reactive.function.client.ClientResponse response) {
+        if (response.statusCode().isError()) {
+            return toProviderError(provider, response).flatMapMany(Flux::error);
+        }
+        MediaType contentType = response.headers().contentType().orElse(MediaType.TEXT_EVENT_STREAM);
+        if (isJsonContentType(contentType)) {
+            return response.bodyToMono(String.class)
+                    .defaultIfEmpty("")
+                    .flatMapMany(json -> Flux.error(new ProviderException(
+                            "Provider '" + provider.name()
+                                    + "' returned JSON instead of SSE (HTTP "
+                                    + response.statusCode().value() + "): " + truncateForLog(json))));
+        }
+        return response.bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {});
+    }
+
+    /**
+     * 读取 OpenAI SSE；同样拦截 HTTP 200 + JSON 误用场景。
+     */
+    private Flux<ServerSentEvent<String>> readOpenAiSseOrError(
+            OtherProviderItem provider,
+            org.springframework.web.reactive.function.client.ClientResponse response) {
+        if (response.statusCode().isError()) {
+            return toProviderError(provider, response).flatMapMany(Flux::error);
+        }
+        MediaType contentType = response.headers().contentType().orElse(MediaType.TEXT_EVENT_STREAM);
+        if (isJsonContentType(contentType)) {
+            return response.bodyToMono(String.class)
+                    .defaultIfEmpty("")
+                    .flatMapMany(json -> Flux.error(new ProviderException(
+                            "Provider '" + provider.name()
+                                    + "' returned JSON instead of SSE (HTTP "
+                                    + response.statusCode().value() + "): " + truncateForLog(json))));
+        }
+        return response.bodyToFlux(new ParameterizedTypeReference<ServerSentEvent<String>>() {});
+    }
+
+    /**
+     * Anthropic 官方 SSE 要求 event: 行；部分供应商只在 data JSON 的 type 里带事件名。
+     * 转发前补齐 event，避免 Claude Code 认为流畸形。
+     */
+    private ServerSentEvent<String> normalizeAnthropicSseEvent(ServerSentEvent<String> event) {
+        if (event == null) {
+            return ServerSentEvent.<String>builder().data("").build();
+        }
+        if (event.event() != null && !event.event().isBlank()) {
+            return event;
+        }
+        String data = event.data();
+        if (data == null || data.isBlank()) {
+            return event;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(data);
+            String type = root.path("type").asText(null);
+            if (type != null && !type.isBlank()) {
+                return ServerSentEvent.<String>builder()
+                        .id(event.id())
+                        .event(type)
+                        .data(data)
+                        .comment(event.comment())
+                        .retry(event.retry())
+                        .build();
+            }
+        } catch (Exception ignored) {
+            // 非 JSON data 原样透传
+        }
+        return event;
+    }
+
+    private static boolean isJsonContentType(MediaType contentType) {
+        return contentType != null && (
+                MediaType.APPLICATION_JSON.isCompatibleWith(contentType)
+                        || "json".equalsIgnoreCase(contentType.getSubtype())
+                        || contentType.getSubtype().toLowerCase(Locale.ROOT).endsWith("+json"));
+    }
+
+    private boolean looksLikeUpstreamErrorJson(String json) {
+        try {
+            JsonNode root = objectMapper.readTree(json);
+            if (root.has("error")) {
+                return true;
+            }
+            String type = root.path("type").asText("");
+            return "error".equals(type);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String truncateForLog(String text) {
+        if (text == null) {
+            return "";
+        }
+        String trimmed = text.trim();
+        if (trimmed.length() <= 500) {
+            return trimmed;
+        }
+        return trimmed.substring(0, 500) + "...";
     }
 
     private static String normalizeTraceId(String traceId) {
         return (traceId == null || traceId.isBlank()) ? "-" : traceId;
+    }
+
+    /** 请求体声明 stream 优先；否则看 capabilities 是否含 stream/streaming */
+    private boolean resolveStreaming(ProviderConfig mapping, String requestBody) {
+        try {
+            JsonNode root = objectMapper.readTree(requestBody);
+            if (root.has("stream")) {
+                return root.get("stream").asBoolean(false);
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return supportsStreaming(mapping);
     }
 
     private boolean isStreamRequested(String body) {

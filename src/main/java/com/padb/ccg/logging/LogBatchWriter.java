@@ -1,6 +1,6 @@
 package com.padb.ccg.logging;
 
-import com.padb.ccg.core.model.ProviderChannel;
+import com.padb.ccg.core.model.ProviderNames;
 import com.padb.ccg.core.model.RequestLogEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -150,9 +150,12 @@ public class LogBatchWriter {
                 });
     }
 
-    /** 将渠道枚举序列化为数据库中的稳定字符串 */
-    private static String providerName(ProviderChannel provider) {
-        return provider == null ? ProviderChannel.AWS.name() : provider.name();
+    /** 将供应商标识规范为数据库中的稳定字符串 */
+    private static String providerName(String provider) {
+        if (provider == null || provider.isBlank()) {
+            return ProviderNames.AWS;
+        }
+        return provider.trim();
     }
 
     /** 个人 + 渠道维度 token 用量小时窗口聚合 key */

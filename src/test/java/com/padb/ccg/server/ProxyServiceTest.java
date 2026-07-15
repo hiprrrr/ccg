@@ -3,7 +3,7 @@ package com.padb.ccg.server;
 import com.padb.ccg.auth.AuthService;
 import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
-import com.padb.ccg.core.model.ProviderChannel;
+import com.padb.ccg.core.model.ProviderNames;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.spi.RateLimiter;
 import com.padb.ccg.core.spi.RequestLogger;
@@ -95,7 +95,7 @@ class ProxyServiceTest {
 
     @Test
     void shouldReturn403WhenUnauthorized() {
-        var mapping = new ProviderConfig(ProviderChannel.AWS, "claude-opus-4-7",
+        var mapping = new ProviderConfig(ProviderNames.AWS, "claude-opus-4-7",
                 "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
         when(providerRegistry.resolve("claude-opus-4-7")).thenReturn(Optional.of(mapping));
         when(authService.authorize("token1", "claude-opus-4-7"))
@@ -112,7 +112,7 @@ class ProxyServiceTest {
 
     @Test
     void shouldAcceptBearerTokenAndUsePersonId() {
-        var mapping = new ProviderConfig(ProviderChannel.AWS, "claude-opus-4-7",
+        var mapping = new ProviderConfig(ProviderNames.AWS, "claude-opus-4-7",
                 "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
         var authResult = new AuthResult("person1", java.time.Instant.now().plusSeconds(7200),
                 java.util.List.of(new ModelAuthorization("claude-opus-4-7", java.time.Instant.now().plusSeconds(7200))));

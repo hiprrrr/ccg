@@ -1,9 +1,7 @@
 package com.padb.ccg.proxy;
 
 import com.padb.ccg.core.exception.ProviderException;
-import com.padb.ccg.core.model.ProviderAccount;
-import com.padb.ccg.core.model.ProviderChannel;
-import com.padb.ccg.core.model.ProviderConfig;
+import com.padb.ccg.core.model.ProviderNames;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -15,97 +13,83 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class UpstreamAccountSelectorTest {
 
-    private static final HuaweiMaasProperties HUAWEI_GLOBAL =
-            new HuaweiMaasProperties(null, "global-huawei-key", "openai", 3, 300);
-
     @Test
-    void shouldPickHuaweiAccountFromPool() {
-        var mapping = new ProviderConfig(
-                ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of(),
-                List.of(
-                        new ProviderAccount("a1", "key-1"),
-                        new ProviderAccount("a2", "key-2"),
-                        new ProviderAccount("a3", "key-3")
-                ));
+    void shouldPickKeyFromPool() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("key-1", "key-2", "key-3"), "openai");
 
         Set<String> picked = IntStream.range(0, 30)
-                .mapToObj(i -> UpstreamAccountSelector.selectHuawei(mapping, HUAWEI_GLOBAL).apiKey())
+                .mapToObj(i -> UpstreamAccountSelector.select(provider).apiKey())
                 .collect(Collectors.toSet());
 
         assertTrue(picked.contains("key-1"));
         assertTrue(picked.contains("key-2"));
         assertTrue(picked.contains("key-3"));
-        assertFalse(picked.contains("global-huawei-key"));
     }
 
     @Test
-    void shouldFallbackToGlobalHuaweiKeyWhenNoAccounts() {
-        var mapping = new ProviderConfig(ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of());
+    void shouldUseSingleKey() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("only-key"), "openai");
 
-        var selection = UpstreamAccountSelector.selectHuawei(mapping, HUAWEI_GLOBAL);
+        var selection = UpstreamAccountSelector.select(provider);
 
-        assertEquals("default", selection.accountId());
-        assertEquals("global-huawei-key", selection.apiKey());
+        assertEquals("only-key", selection.apiKey());
+        assertTrue(selection.accountId().startsWith("huawei-"));
     }
 
     @Test
-    void shouldSkipEmptyHuaweiAccountsButKeepValidOnes() {
-        var mapping = new ProviderConfig(
-                ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of(),
-                List.of(
-                        new ProviderAccount("huawei-1", ""),
-                        new ProviderAccount("huawei-2", "key-2"),
-                        new ProviderAccount("huawei-3", "key-3")
-                ));
+    void shouldSkipBlankKeysButKeepValidOnes() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("", "key-2", "key-3"), "openai");
 
         Set<String> picked = IntStream.range(0, 50)
-                .mapToObj(i -> UpstreamAccountSelector.selectHuawei(mapping, HUAWEI_GLOBAL).apiKey())
+                .mapToObj(i -> UpstreamAccountSelector.select(provider).apiKey())
                 .collect(Collectors.toSet());
 
-        assertFalse(picked.contains("key-1"));
+        assertFalse(picked.contains(""));
         assertTrue(picked.contains("key-2"));
         assertTrue(picked.contains("key-3"));
-        assertFalse(picked.contains("global-huawei-key"));
     }
 
     @Test
-    void shouldDistributeHuaweiAccountsRoughlyEvenly() {
-        var mapping = new ProviderConfig(
-                ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of(),
-                List.of(
-                        new ProviderAccount("a1", "key-1"),
-                        new ProviderAccount("a2", "key-2"),
-                        new ProviderAccount("a3", "key-3")
-                ));
+    void shouldDistributeKeysRoughlyEvenly() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("key-1", "key-2", "key-3"), "openai");
 
-        long firstAccountHits = IntStream.range(0, 3000)
-                .mapToObj(i -> UpstreamAccountSelector.selectHuawei(mapping, HUAWEI_GLOBAL).accountId())
-                .filter("a1"::equals)
+        long firstKeyHits = IntStream.range(0, 3000)
+                .mapToObj(i -> UpstreamAccountSelector.select(provider).apiKey())
+                .filter("key-1"::equals)
                 .count();
 
-        // 3000 次均匀随机，首个账号期望约 1000 次；放宽到 700~1300 避免偶发失败
-        assertTrue(firstAccountHits >= 700 && firstAccountHits <= 1300,
-                "first account hit count=" + firstAccountHits + ", expected ~1000");
+        assertTrue(firstKeyHits >= 700 && firstKeyHits <= 1300,
+                "first key hit count=" + firstKeyHits + ", expected ~1000");
     }
 
     @Test
-    void shouldSkipInvalidHuaweiAccountsAndUseGlobal() {
-        var mapping = new ProviderConfig(
-                ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of(),
-                List.of(new ProviderAccount("empty", "")));
+    void shouldFailWhenOnlyBlankKeys() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("", "  "), "openai");
 
-        var selection = UpstreamAccountSelector.selectHuawei(mapping, HUAWEI_GLOBAL);
-
-        assertEquals("default", selection.accountId());
-        assertEquals("global-huawei-key", selection.apiKey());
+        assertThrows(ProviderException.class, () -> UpstreamAccountSelector.select(provider));
     }
 
     @Test
-    void shouldFailWhenNoHuaweiKeyAvailable() {
-        var mapping = new ProviderConfig(ProviderChannel.HUAWEI, "glm-5.2", "glm-5.2", null, List.of());
-        var emptyGlobal = new HuaweiMaasProperties(null, "", "openai", 3, 300);
+    void shouldFailWhenNoKeys() {
+        var empty = new OtherProviderItem("huawei", "https://example.com", List.of(), "openai");
 
-        assertThrows(ProviderException.class,
-                () -> UpstreamAccountSelector.selectHuawei(mapping, emptyGlobal));
+        assertThrows(ProviderException.class, () -> UpstreamAccountSelector.select(empty));
+    }
+
+    @Test
+    void awsProviderNameIsRecognized() {
+        assertTrue(ProviderNames.isAws("aws"));
+        assertTrue(ProviderNames.isAws("AWS"));
+        assertFalse(ProviderNames.isAws("huawei"));
     }
 }

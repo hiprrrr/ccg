@@ -1,10 +1,9 @@
 package com.padb.ccg.routing;
 
-import com.padb.ccg.core.model.ProviderAccount;
-import com.padb.ccg.core.model.ProviderChannel;
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.spi.ProviderRegistry;
 import com.padb.ccg.proxy.ModelMappingsProperties;
+import com.padb.ccg.proxy.OtherProvidersRegistry;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,16 +22,19 @@ public class ProviderRegistryImpl implements ProviderRegistry {
     private static final Logger log = LoggerFactory.getLogger(ProviderRegistryImpl.class);
 
     private final ModelMappingsProperties modelMappingsProperties;
+    private final OtherProvidersRegistry otherProvidersRegistry;
 
     /** 模型名称 → 供应商配置的映射表，原子引用保证线程安全的读写 */
     private final AtomicReference<Map<String, ProviderConfig>> modelMap =
             new AtomicReference<>(Map.of());
 
-    public ProviderRegistryImpl(ModelMappingsProperties modelMappingsProperties) {
+    public ProviderRegistryImpl(ModelMappingsProperties modelMappingsProperties,
+                                OtherProvidersRegistry otherProvidersRegistry) {
         this.modelMappingsProperties = modelMappingsProperties;
+        this.otherProvidersRegistry = otherProvidersRegistry;
     }
 
-    /** 启动时从配置加载 AWS / 华为云模型映射 */
+    /** 启动时从配置加载模型映射，并校验非 aws 的 provider 在 other-providers 中存在 */
     @PostConstruct
     void init() {
         List<ProviderConfig> configs = modelMappingsProperties.toProviderConfigs();
@@ -56,18 +58,18 @@ public class ProviderRegistryImpl implements ProviderRegistry {
     public void rebuild(List<ProviderConfig> configs) {
         Map<String, ProviderConfig> newMap = new HashMap<>();
         for (ProviderConfig c : configs) {
+            validateProviderReference(c);
             ProviderConfig existing = newMap.put(c.modelName(), c);
             if (existing != null) {
                 log.warn("Duplicate model '{}' mapped to both provider={}/{} and provider={}/{}; using last",
                         c.modelName(), existing.provider(), existing.upstreamModelId(),
                         c.provider(), c.upstreamModelId());
             }
-            warnHuaweiAccountsWithEmptyKeys(c);
         }
         modelMap.set(Collections.unmodifiableMap(newMap));
-        long awsCount = newMap.values().stream().filter(c -> c.provider() == com.padb.ccg.core.model.ProviderChannel.AWS).count();
-        long huaweiCount = newMap.size() - awsCount;
-        log.info("Model registry rebuilt: {} mapping(s) (aws={}, huawei={})", newMap.size(), awsCount, huaweiCount);
+        long awsCount = newMap.values().stream().filter(ProviderConfig::isAws).count();
+        long otherCount = newMap.size() - awsCount;
+        log.info("Model registry rebuilt: {} mapping(s) (aws={}, other={})", newMap.size(), awsCount, otherCount);
     }
 
     /** 获取当前注册的模型数量 */
@@ -76,22 +78,16 @@ public class ProviderRegistryImpl implements ProviderRegistry {
     }
 
     /**
-     * 华为模型若配置了 accounts 但部分 api-key 为空，启动/热更新时告警，避免误以为在均匀分流。
+     * 非 aws 的 provider 必须能在 other-providers 中解析到。
      */
-    private static void warnHuaweiAccountsWithEmptyKeys(ProviderConfig config) {
-        if (config.provider() != ProviderChannel.HUAWEI || !config.hasAccounts()) {
+    private void validateProviderReference(ProviderConfig config) {
+        if (config.isAws()) {
             return;
         }
-        List<ProviderAccount> accounts = config.accounts();
-        long validCount = accounts.stream().filter(ProviderAccount::hasApiKey).count();
-        if (validCount < accounts.size()) {
-            List<String> skippedIds = accounts.stream()
-                    .filter(a -> !a.hasApiKey())
-                    .map(a -> a.resolvedId("?"))
-                    .toList();
-            log.warn("Model '{}' huawei accounts: {} configured, {} with api-key; skipped ids={} — "
-                            + "empty keys are excluded from random pool",
-                    config.modelName(), accounts.size(), validCount, skippedIds);
+        if (otherProvidersRegistry.find(config.provider()).isEmpty()) {
+            throw new IllegalStateException(
+                    "model-mappings model '" + config.modelName() + "' references unknown provider '"
+                            + config.provider() + "' — declare it under other-providers");
         }
     }
 }

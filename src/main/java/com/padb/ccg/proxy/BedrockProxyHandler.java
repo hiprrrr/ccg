@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Bedrock 代理处理器，负责将请求转发到 AWS Bedrock 并通过 SSE 流式返回响应。
  *
  * 核心流程：
- * 1. 按区域缓存 {@link BedrockRuntimeAsyncClient} 实例（底层 Netty 读超时与 {@code timeout-seconds} 对齐，避免流式 chunk 间隔过长被默认 ~30s 读超时断开）
+ * 1. 按区域缓存 {@link BedrockRuntimeAsyncClient} 实例（底层 Netty 读超时与 {@code upstream.timeout-seconds} 对齐，避免流式 chunk 间隔过长被默认 ~30s 读超时断开）
  * 2. 构建流式调用请求，通过 Flux.push 桥接 Bedrock 异步回调到 Reactor Flux
  * 3. 在 boundedElastic 调度器上执行阻塞性 AWS SDK 调用
  * 4. 实时提取响应中的 token 用量信息
@@ -63,13 +63,16 @@ public class BedrockProxyHandler {
     private static final AwsCredentialsProvider DEFAULT_CREDENTIALS_PROVIDER = DefaultCredentialsProvider.create();
 
     private final BedrockProperties props;
+    private final UpstreamProperties upstreamProperties;
     private final ObjectMapper objectMapper;
 
     /** 按区域缓存 BedrockAsyncClient，避免重复创建 */
     private final Map<String, BedrockRuntimeAsyncClient> clients = new ConcurrentHashMap<>();
 
-    public BedrockProxyHandler(BedrockProperties props, ObjectMapper objectMapper) {
+    public BedrockProxyHandler(BedrockProperties props, UpstreamProperties upstreamProperties,
+                               ObjectMapper objectMapper) {
         this.props = props;
+        this.upstreamProperties = upstreamProperties;
         this.objectMapper = objectMapper;
     }
 
@@ -89,10 +92,10 @@ public class BedrockProxyHandler {
 
     /**
      * 创建带 Netty 读/写超时配置的异步 Bedrock 客户端。
-     * <p>默认 Netty 客户端两次读事件间隔约 30s 即超时；大模型首包或 chunk 间隔可能超过该值，需与 {@link BedrockProperties#timeoutSeconds()} 一致。</p>
+     * <p>默认 Netty 客户端两次读事件间隔约 30s 即超时；大模型首包或 chunk 间隔可能超过该值，需与 {@link UpstreamProperties#timeoutSeconds()} 一致。</p>
      */
     private BedrockRuntimeAsyncClient buildBedrockClientForRegion(String awsRegion) {
-        int sec = Math.max(1, props.timeoutSeconds());
+        int sec = Math.max(1, upstreamProperties.timeoutSeconds());
         Duration d = Duration.ofSeconds(sec);
         SdkAsyncHttpClient http = NettyNioAsyncHttpClient.builder()
                 .readTimeout(d)
@@ -104,7 +107,7 @@ public class BedrockProxyHandler {
                 .credentialsProvider(bedrockCredentialsProvider())
                 .httpClient(http)
                 .overrideConfiguration(b -> b
-                        .retryPolicy(RetryPolicy.builder().numRetries(props.retryMax()).build())
+                        .retryPolicy(RetryPolicy.builder().numRetries(upstreamProperties.retryMax()).build())
                         .apiCallTimeout(d))
                 .build();
     }

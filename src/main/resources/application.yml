@@ -55,6 +55,15 @@ spring:
     locations: classpath:db/migration
 
 # ============================================================================
+# 上游调用全局参数（Bedrock / HTTP 透传共用）
+# ============================================================================
+upstream:
+  # 最大重试次数：上游 API 调用失败时的最大重试次数
+  retry-max: 3
+  # 请求超时时间：等待上游响应的最大时间（秒）；流式请求整个生命周期不应超过此值
+  timeout-seconds: 300
+
+# ============================================================================
 # AWS Bedrock 模型代理配置
 # ============================================================================
 bedrock:
@@ -70,12 +79,6 @@ bedrock:
   # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
   # - passthrough: 直接透传 Bedrock 原始响应，不做转换
   response-format: ${BEDROCK_RESPONSE_FORMAT:anthropic}
-  # 最大重试次数：Bedrock API 调用失败时的最大重试次数
-  # 用于处理临时性网络故障或服务端错误
-  retry-max: 3
-  # 请求超时时间：等待 Bedrock 响应的最大时间（秒）
-  # 流式请求的整个生命周期不应超过此值
-  timeout-seconds: 300
 
   # ---------------------------------------------------------------------------
   # 工具调用追踪配置（仅用于调试）
@@ -90,21 +93,28 @@ bedrock:
   tool-call-trace-max-chars: 6000
 
 # ============================================================================
-# 华为云 MaaS 模型代理配置
+# HTTP 透传供应商列表（与 AWS Bedrock 平行）
+# model-mappings.provider 写下列表中的 name（aws 除外）
 # ============================================================================
-huawei-maas:
-  # 上游 API 格式：anthropic（默认）或 openai
-  # - anthropic: base-url 示例 https://api-ap-southeast-1.modelarts-maas.com/anthropic → /v1/messages，鉴权 x-api-key
-  # - openai:    base-url 示例 https://api-ap-southeast-1.modelarts-maas.com/openai/v1 → /chat/completions，鉴权 Bearer
-  api-format: ${HUAWEI_MAAS_API_FORMAT:openai}
-  # 未配置时按 api-format 使用默认域名；也可显式覆盖
-  base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/openai/v1}
-  api-key: ${HUAWEI_MAAS_API_KEY:}
-  retry-max: 3
-  timeout-seconds: 300
+other-providers:
+  - name: huawei
+    # 上游 API 格式（可选）：
+    # - anthropic: base-url 指向 Anthropic 根路径 → /v1/messages，鉴权 x-api-key；OpenAI 客户端会先转成 Anthropic
+    # - openai:    base-url 指向 OpenAI 根路径 → /chat/completions，鉴权 Bearer；Anthropic 客户端会先转成 OpenAI
+    # - 不配置:    按客户端协议完全透传（Anthropic↔Anthropic、OpenAI↔OpenAI），不做格式互转
+    api-format: ${HUAWEI_MAAS_API_FORMAT:anthropic}
+    base-url: ${HUAWEI_MAAS_BASE_URL:https://api-ap-southeast-1.modelarts-maas.com/anthropic}
+    # 可配 1 个或多个 key；多个时每次请求均匀随机选取，降低单 Key 限流风险
+    api-keys:
+      - ${HUAWEI_MAAS_API_KEY:}
+  - name: basicrouter
+    # 单一 URL、无 anthropic/openai 分叉：不配 api-format，按客户端协议透传
+    base-url: https://api.basicrouter.ai/api
+    api-keys:
+      - ${BASICROUTER_API_KEY_1:}
 
 # ============================================================================
-# 模型映射：model-name 下声明 provider（aws / huawei）及同级的上游参数
+# 模型映射：model-name 下声明 provider（aws / other-providers 中的 name）及同级的上游参数
 # ============================================================================
 model-mappings:
   - model-name: glm-5
@@ -123,15 +133,24 @@ model-mappings:
       - text
       - tools
       - stream
-    # 多账号随机分流：每次请求随机选一个 api-key，降低单 Key 限流风险
-    # 未配置 accounts 时回退到 huawei-maas 全局配置（当前无全局 api-key，须配齐 accounts）
-    accounts:
-      - id: huawei-1
-        api-key: ${HUAWEI_MAAS_API_KEY_1:}
-      - id: huawei-2
-        api-key: ${HUAWEI_MAAS_API_KEY_2:}
-      - id: huawei-3
-        api-key: ${HUAWEI_MAAS_API_KEY_3:}
+
+  - model-name: claude-sonnet-5
+    provider: basicrouter
+    upstream-model-id: claude-sonnet-5
+    capabilities:
+      - text
+      - vision
+      - tools
+      - stream
+
+  - model-name: claude-opus-4.8
+    provider: basicrouter
+    upstream-model-id: claude-opus-4.8
+    capabilities:
+      - text
+      - vision
+      - tools
+      - stream
 
 # ============================================================================
 # 认证配置

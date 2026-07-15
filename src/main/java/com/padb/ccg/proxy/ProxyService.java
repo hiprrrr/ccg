@@ -89,7 +89,7 @@ public class ProxyService {
                             requestId, token.hashCode(), model, body.length(),
                             body.contains("\"tool_use\""), body.contains("\"tool_result\""), body.contains("\"tools\""));
 
-                    // 查找模型映射（AWS / 华为云）
+                    // 查找模型映射（aws / other-providers）
                     var mappingOpt = providerRegistry.resolve(model);
                     if (mappingOpt.isEmpty()) {
                         log.warn("No model mapping found for model='{}'", model);

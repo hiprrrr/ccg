@@ -7,7 +7,7 @@ import java.time.Instant;
  *
  * @param personId     个人 ID
  * @param model        请求的模型名称
- * @param provider     上游渠道（AWS / 华为云）
+ * @param provider     上游渠道名（aws 或 other-providers 中的 name）
  * @param providerId   实际调用的上游模型 ID
  * @param success      请求是否成功
  * @param errorMsg     错误信息（成功时为 null）
@@ -16,7 +16,7 @@ import java.time.Instant;
  * @param durationMs   请求耗时（毫秒）
  * @param createdAt    日志创建时间
  */
-public record RequestLogEntry(String personId, String model, ProviderChannel provider, String providerId,
+public record RequestLogEntry(String personId, String model, String provider, String providerId,
                               boolean success, String errorMsg,
                               Integer inputTokens, Integer outputTokens,
                               int durationMs, Instant createdAt) {

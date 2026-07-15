@@ -2,9 +2,10 @@ package com.padb.ccg.server;
 
 import com.padb.ccg.auth.AuthProperties;
 import com.padb.ccg.proxy.BedrockProperties;
-import com.padb.ccg.proxy.HuaweiMaasProperties;
 import com.padb.ccg.proxy.ModelMappingsProperties;
+import com.padb.ccg.proxy.OtherProvidersProperties;
 import com.padb.ccg.proxy.RateLimitProperties;
+import com.padb.ccg.proxy.UpstreamProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -14,8 +15,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
  * 扫描 {@code com.padb.ccg} 包下的所有组件并启用配置属性绑定。
  */
 @SpringBootApplication(scanBasePackages = "com.padb.ccg")
-@EnableConfigurationProperties({AuthProperties.class, BedrockProperties.class, HuaweiMaasProperties.class,
-        ModelMappingsProperties.class, RateLimitProperties.class})
+@EnableConfigurationProperties({AuthProperties.class, BedrockProperties.class, UpstreamProperties.class,
+        OtherProvidersProperties.class, ModelMappingsProperties.class, RateLimitProperties.class})
 public class GatewayApplication {
 
     public static void main(String[] args) {
