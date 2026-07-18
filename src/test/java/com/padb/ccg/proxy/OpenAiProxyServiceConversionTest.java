@@ -3,8 +3,6 @@ package com.padb.ccg.proxy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Method;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -27,13 +25,13 @@ class OpenAiProxyServiceConversionTest {
                    {"role":"tool","tool_call_id":"call_1","content":"file contents"}
                  ]}""";
 
-        String anthropic = invokeConvertRequestBody(openAi);
+        String anthropic = OpenAiChatRequestConverter.toAnthropic(mapper, openAi);
         assertThat(anthropic).contains("\"type\":\"tool_use\"");
         assertThat(anthropic).contains("\"tool_use_id\":\"call_1\"");
         assertThat(anthropic).doesNotContain("\"role\":\"tool\"");
 
         String bedrockBody = BedrockInvokeBodyPreparer.normalizeMetadata(
-                mapper, stripModel(anthropic), "u1", "zai.glm-5");
+                mapper, anthropic, "u1", "zai.glm-5");
 
         assertThat(bedrockBody).contains("\"tool_call_id\":\"call_1\"");
         assertThat(bedrockBody).contains("\"tool_calls\"");
@@ -48,24 +46,12 @@ class OpenAiProxyServiceConversionTest {
                   {"role":"tool","content":"orphan result"}
                 ]}""";
 
-        String anthropic = invokeConvertRequestBody(openAi);
+        String anthropic = OpenAiChatRequestConverter.toAnthropic(mapper, openAi);
         assertThat(anthropic).doesNotContain("\"role\":\"tool\"");
         assertThat(anthropic).contains("orphan result");
 
         String bedrockBody = BedrockInvokeBodyPreparer.normalizeMetadata(
-                mapper, stripModel(anthropic), "u1", "zai.glm-5");
+                mapper, anthropic, "u1", "zai.glm-5");
         assertThat(bedrockBody).doesNotContain("\"role\":\"tool\"");
-    }
-
-    private String invokeConvertRequestBody(String openAiBody) throws Exception {
-        OpenAiProxyService service = new OpenAiProxyService(
-                null, null, null, null, null, null, mapper);
-        Method method = OpenAiProxyService.class.getDeclaredMethod("convertRequestBody", String.class);
-        method.setAccessible(true);
-        return (String) method.invoke(service, openAiBody);
-    }
-
-    private static String stripModel(String body) {
-        return body.replaceFirst("\"model\"\\s*:\\s*\"[^\"]*\"\\s*,?", "");
     }
 }

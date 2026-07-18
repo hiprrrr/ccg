@@ -104,22 +104,14 @@ public class OpenAiProxyService {
                     if (openAiPassthrough) {
                         bodyToForward = body;
                     } else {
-                        String convertedBody = convertRequestBody(body);
+                        String convertedBody = OpenAiChatRequestConverter.toAnthropic(objectMapper, body);
                         String anthropicBody = convertedBody != null ? convertedBody : body;
-                        if (!mapping.supportsVision() && hasImageContent(anthropicBody)) {
-                            try {
-                                bodyToForward = AnthropicMessageImageStripper.stripImageBlocks(
-                                        objectMapper, anthropicBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-                                log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
-                            } catch (Exception e) {
-                                log.warn("Failed to strip image blocks for model='{}' id={}: {}",
-                                        model, requestId, e.getMessage());
-                                return respondOpenAiError(400, "invalid_request_error",
-                                        "Model '" + model + "' does not support image input");
-                            }
-                        } else {
-                            bodyToForward = anthropicBody;
+                        String stripped = stripImagesIfNonVision(mapping, anthropicBody, model, requestId);
+                        if (stripped == null) {
+                            return respondOpenAiError(400, "invalid_request_error",
+                                    "Model '" + model + "' does not support image input");
                         }
+                        bodyToForward = stripped;
                     }
 
                     // 初始化 token 计数器和错误引用
@@ -128,12 +120,7 @@ public class OpenAiProxyService {
                     var errorRef = new AtomicReference<String>(null);
 
                     // 认证 → 限流 → 代理转发
-                    return authService.authorize(token, model)
-                            .flatMap(authResult -> {
-                                String personId = authResult.personId();
-                                return rateLimiter.tryAcquire(personId)
-                                        .thenReturn(personId);
-                            })
+                    return authorizeAndRateLimit(token, model)
                             .flatMap(personId -> {
                                 if (openAiPassthrough) {
                                     if (streamRequested) {
@@ -189,31 +176,18 @@ public class OpenAiProxyService {
                     }
                     var mapping = mappingOpt.get();
 
-                    String preparedBody = convertedBody;
-                    if (!mapping.supportsVision() && hasImageContent(convertedBody)) {
-                        try {
-                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
-                                    objectMapper, convertedBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
-                        } catch (Exception e) {
-                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
-                                    model, requestId, e.getMessage());
-                            return respondOpenAiError(400, "invalid_request_error",
-                                    "Model '" + model + "' does not support image input");
-                        }
+                    String stripped = stripImagesIfNonVision(mapping, convertedBody, model, requestId);
+                    if (stripped == null) {
+                        return respondOpenAiError(400, "invalid_request_error",
+                                "Model '" + model + "' does not support image input");
                     }
-                    final String bodyToForward = preparedBody;
+                    final String bodyToForward = stripped;
 
                     var inputTokens = new AtomicInteger(0);
                     var outputTokens = new AtomicInteger(0);
                     var errorRef = new AtomicReference<String>(null);
 
-                    return authService.authorize(token, model)
-                            .flatMap(authResult -> {
-                                String personId = authResult.personId();
-                                return rateLimiter.tryAcquire(personId)
-                                        .thenReturn(personId);
-                            })
+                    return authorizeAndRateLimit(token, model)
                             .flatMap(personId -> {
                                 if (streamRequested) {
                                     return handleResponsesStreamingRequest(mapping, bodyToForward, personId, model,
@@ -233,76 +207,22 @@ public class OpenAiProxyService {
                                                                 String model, String requestId,
                                                                 AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                                 AtomicReference<String> errorRef, Instant start) {
-        var responsesConverterRef = new AtomicReference<OpenAiResponsesSseConverter>(null);
-        responsesConverterRef.set(new OpenAiResponsesSseConverter(objectMapper, model));
+        var converter = new OpenAiResponsesSseConverter(objectMapper, model);
 
-        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
-                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
-
-        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
-                .interval(SSE_HEARTBEAT_INTERVAL)
-                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
-
-        Flux<ServerSentEvent<String>> responsesFlux = bedrockFlux
+        Flux<ServerSentEvent<String>> responsesFlux = upstreamRouter
+                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId)
                 .flatMap(event -> {
                     String data = event.data();
                     if (data == null || data.isEmpty()) {
                         return Flux.empty();
                     }
-                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
-                    if (converter == null) {
-                        return Flux.empty();
-                    }
                     return Flux.fromIterable(converter.convert(data));
                 })
-                .concatWith(Flux.defer(() -> {
-                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
-                    if (converter == null) {
-                        return Flux.empty();
-                    }
-                    return Flux.fromIterable(converter.endStreamIfOpen());
-                }))
-                .publish(shared -> Flux.merge(
-                        shared,
-                        heartbeatFlux.takeUntilOther(shared.ignoreElements())
-                ))
-                .doOnError(e -> {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                    errorRef.set(msg);
-                })
-                .doFinally(signal -> {
-                    switch (signal) {
-                        case ON_COMPLETE:
-                            log.info("OpenAI Responses SSE completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis(),
-                                    inputTokens.get(), outputTokens.get());
-                            logRequest(personId, mapping, true, null,
-                                    inputTokens.get(), outputTokens.get(), start);
-                            break;
-                        case ON_ERROR:
-                            log.warn("OpenAI Responses SSE errored: id={} personId={} model={} durationMs={} error={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis(),
-                                    errorRef.get());
-                            logRequest(personId, mapping, false, errorRef.get(),
-                                    inputTokens.get(), outputTokens.get(), start);
-                            break;
-                        case CANCEL:
-                            log.info("OpenAI Responses SSE cancelled: id={} personId={} model={} durationMs={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis());
-                            break;
-                        default:
-                            break;
-                    }
-                });
+                // 流正常结束后补齐未关闭的 response 结束事件
+                .concatWith(Flux.defer(() -> Flux.fromIterable(converter.endStreamIfOpen())));
 
-        return ServerResponse.ok()
-                .contentType(MediaType.TEXT_EVENT_STREAM)
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .body(BodyInserters.fromServerSentEvents(responsesFlux));
+        return sseResponse(withStreamAccounting(withHeartbeat(responsesFlux),
+                mapping, personId, model, requestId, inputTokens, outputTokens, errorRef, start));
     }
 
     /**
@@ -312,41 +232,31 @@ public class OpenAiProxyService {
                                                                      String model, String requestId,
                                                                      AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                                      Instant start) {
-        var responsesConverterRef = new AtomicReference<OpenAiResponsesSseConverter>(null);
-        responsesConverterRef.set(new OpenAiResponsesSseConverter(objectMapper, model));
+        var converter = new OpenAiResponsesSseConverter(objectMapper, model);
 
-        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
-                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
-
-        return bedrockFlux
+        return upstreamRouter.forward(mapping, body, inputTokens, outputTokens, personId, model, requestId)
                 .flatMap(event -> {
                     String data = event.data();
                     if (data == null || data.isEmpty()) {
                         return Flux.empty();
                     }
-                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
-                    if (converter != null) {
-                        converter.convert(data);
-                    }
+                    converter.convert(data);
                     return Flux.empty();
                 })
                 .then(Mono.defer(() -> {
-                    OpenAiResponsesSseConverter converter = responsesConverterRef.get();
-                    if (converter != null) {
-                        converter.endStreamIfOpen();
-                    }
+                    converter.endStreamIfOpen();
 
                     ObjectNode response = objectMapper.createObjectNode();
-                    response.put("id", converter != null ? converter.getResponseId() : "resp_unknown");
+                    response.put("id", converter.getResponseId());
                     response.put("object", "response");
                     response.put("created_at", System.currentTimeMillis() / 1000);
-                    response.put("status", converter != null ? converter.getFinishStatus() : "completed");
+                    response.put("status", converter.getFinishStatus());
                     response.put("model", model);
                     response.putNull("error");
                     response.putNull("incomplete_details");
 
                     ArrayNode output = response.putArray("output");
-                    if (converter != null && !converter.getAccumulatedText().isEmpty()) {
+                    if (!converter.getAccumulatedText().isEmpty()) {
                         ObjectNode message = output.addObject();
                         message.put("type", "message");
                         message.put("id", "msg_" + UUID.randomUUID().toString().substring(0, 8));
@@ -360,8 +270,8 @@ public class OpenAiProxyService {
                     }
 
                     ObjectNode usage = response.putObject("usage");
-                    int inTok = converter != null ? converter.getInputTokens() : inputTokens.get();
-                    int outTok = converter != null ? converter.getOutputTokens() : outputTokens.get();
+                    int inTok = converter.getInputTokens();
+                    int outTok = converter.getOutputTokens();
                     usage.put("input_tokens", inTok);
                     usage.put("output_tokens", outTok);
                     usage.put("total_tokens", inTok + outTok);
@@ -402,45 +312,8 @@ public class OpenAiProxyService {
         Flux<ServerSentEvent<String>> upstreamFlux = upstreamRouter
                 .forwardOpenAi(mapping, body, inputTokens, outputTokens, personId, model, requestId);
 
-        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
-                .interval(SSE_HEARTBEAT_INTERVAL)
-                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
-
-        Flux<ServerSentEvent<String>> sseFlux = upstreamFlux
-                .publish(shared -> Flux.merge(
-                        shared,
-                        heartbeatFlux.takeUntilOther(shared.ignoreElements())
-                ))
-                .doOnError(e -> {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                    errorRef.set(msg);
-                })
-                .doFinally(signal -> {
-                    switch (signal) {
-                        case ON_COMPLETE -> {
-                            log.info("OpenAI SSE passthrough completed: id={} personId={} model={} provider={} durationMs={} inputTokens={} outputTokens={}",
-                                    requestId, personId, model, mapping.provider(),
-                                    Duration.between(start, Instant.now()).toMillis(),
-                                    inputTokens.get(), outputTokens.get());
-                            logRequest(personId, mapping, true, null,
-                                    inputTokens.get(), outputTokens.get(), start);
-                        }
-                        case ON_ERROR -> {
-                            log.warn("OpenAI SSE passthrough errored: id={} personId={} model={} provider={} error={}",
-                                    requestId, personId, model, mapping.provider(), errorRef.get());
-                            logRequest(personId, mapping, false, errorRef.get(),
-                                    inputTokens.get(), outputTokens.get(), start);
-                        }
-                        default -> {
-                        }
-                    }
-                });
-
-        return ServerResponse.ok()
-                .contentType(MediaType.TEXT_EVENT_STREAM)
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .body(BodyInserters.fromServerSentEvents(sseFlux));
+        return sseResponse(withStreamAccounting(withHeartbeat(upstreamFlux),
+                mapping, personId, model, requestId, inputTokens, outputTokens, errorRef, start));
     }
 
     /**
@@ -479,78 +352,21 @@ public class OpenAiProxyService {
                                                          String model, String requestId,
                                                          AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                          AtomicReference<String> errorRef, Instant start) {
-        var openAiConverterRef = new AtomicReference<OpenAiSseConverter>(null);
+        var converter = new OpenAiSseConverter(objectMapper, model);
 
-        // 初始化 OpenAI 转换器
-        openAiConverterRef.set(new OpenAiSseConverter(objectMapper, model));
-
-        // 获取 Bedrock 的 Anthropic 格式 SSE 流
-        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
-                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
-
-        // 心跳流
-        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
-                .interval(SSE_HEARTBEAT_INTERVAL)
-                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
-
-        // 转换为 OpenAI 格式
-        Flux<ServerSentEvent<String>> openAiFlux = bedrockFlux
+        // 将 Bedrock 的 Anthropic 格式 SSE 转换为 OpenAI 格式
+        Flux<ServerSentEvent<String>> openAiFlux = upstreamRouter
+                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId)
                 .flatMap(event -> {
                     String data = event.data();
                     if (data == null || data.isEmpty()) {
                         return Flux.empty();
                     }
-
-                    OpenAiSseConverter converter = openAiConverterRef.get();
-                    if (converter == null) {
-                        return Flux.empty();
-                    }
-
-                    // 将 Anthropic 格式转换为 OpenAI 格式
-                    var converted = converter.convert(data);
-                    return Flux.fromIterable(converted);
-                })
-                .publish(shared -> Flux.merge(
-                        shared,
-                        heartbeatFlux.takeUntilOther(shared.ignoreElements())
-                ))
-                .doOnError(e -> {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                    errorRef.set(msg);
-                })
-                .doFinally(signal -> {
-                    switch (signal) {
-                        case ON_COMPLETE:
-                            log.info("OpenAI SSE response completed: id={} personId={} model={} durationMs={} inputTokens={} outputTokens={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis(),
-                                    inputTokens.get(), outputTokens.get());
-                            logRequest(personId, mapping, true, null,
-                                    inputTokens.get(), outputTokens.get(), start);
-                            break;
-                        case ON_ERROR:
-                            log.warn("OpenAI SSE response errored: id={} personId={} model={} durationMs={} error={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis(),
-                                    errorRef.get());
-                            logRequest(personId, mapping, false, errorRef.get(),
-                                    inputTokens.get(), outputTokens.get(), start);
-                            break;
-                        case CANCEL:
-                            log.info("OpenAI SSE response cancelled: id={} personId={} model={} durationMs={}",
-                                    requestId, personId, model,
-                                    Duration.between(start, Instant.now()).toMillis());
-                            break;
-                        default:
-                            break;
-                    }
+                    return Flux.fromIterable(converter.convert(data));
                 });
 
-        return ServerResponse.ok()
-                .contentType(MediaType.TEXT_EVENT_STREAM)
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .body(BodyInserters.fromServerSentEvents(openAiFlux));
+        return sseResponse(withStreamAccounting(withHeartbeat(openAiFlux),
+                mapping, personId, model, requestId, inputTokens, outputTokens, errorRef, start));
     }
 
     /**
@@ -560,27 +376,15 @@ public class OpenAiProxyService {
                                                             String model, String requestId,
                                                             AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                             Instant start) {
-        var openAiConverterRef = new AtomicReference<OpenAiSseConverter>(null);
+        var converter = new OpenAiSseConverter(objectMapper, model);
         var contentBuffer = new StringBuilder();
         var finishReasonRef = new AtomicReference<String>(null);
 
-        // 初始化 OpenAI 转换器
-        openAiConverterRef.set(new OpenAiSseConverter(objectMapper, model));
-
-        // 获取 Bedrock 的 Anthropic 格式 SSE 流
-        Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
-                .forward(mapping, body, inputTokens, outputTokens, personId, model, requestId);
-
         // 收集所有内容并构建完整响应
-        return bedrockFlux
+        return upstreamRouter.forward(mapping, body, inputTokens, outputTokens, personId, model, requestId)
                 .flatMap(event -> {
                     String data = event.data();
                     if (data == null || data.isEmpty()) {
-                        return Flux.empty();
-                    }
-
-                    OpenAiSseConverter converter = openAiConverterRef.get();
-                    if (converter == null) {
                         return Flux.empty();
                     }
 
@@ -665,264 +469,92 @@ public class OpenAiProxyService {
         return false;
     }
 
+    /** 认证 → 限流，返回 personId。 */
+    private Mono<String> authorizeAndRateLimit(String token, String model) {
+        return authService.authorize(token, model)
+                .flatMap(authResult -> {
+                    String personId = authResult.personId();
+                    return rateLimiter.tryAcquire(personId)
+                            .thenReturn(personId);
+                });
+    }
+
     /**
-     * 转换 OpenAI 请求体为 Anthropic 格式
+     * 非视觉模型且请求体含图片块时剥离为占位文本；视觉模型或无图片时原样返回。
+     * 剥离失败返回 null，由调用方转为 400 错误响应。
      */
-    private String convertRequestBody(String openAiBody) {
+    private String stripImagesIfNonVision(ProviderConfig mapping, String body, String model, String requestId) {
+        if (mapping.supportsVision() || !hasImageContent(body)) {
+            return body;
+        }
         try {
-            JsonNode root = objectMapper.readTree(openAiBody);
-            ObjectNode anthropic = objectMapper.createObjectNode();
-
-            // 模型名称
-            if (root.has("model")) {
-                anthropic.put("model", root.get("model").asText());
-            }
-
-            // 消息转换：OpenAI 把 system 放在 messages 里，Anthropic 要求顶层 system 字段，
-            // 因此把 role=system 的消息抽出来拼成顶层 system，其余消息原样保留
-            if (root.has("messages")) {
-                ArrayNode messages = anthropic.putArray("messages");
-                StringBuilder systemText = new StringBuilder();
-                for (JsonNode msg : root.get("messages")) {
-                    String role = msg.path("role").asText();
-
-                    // system 消息：提取文本内容到顶层 system 字段，跳过 messages 数组
-                    if ("system".equals(role)) {
-                        JsonNode sysContent = msg.get("content");
-                        if (sysContent != null && sysContent.isTextual()) {
-                            if (systemText.length() > 0) {
-                                systemText.append("\n\n");
-                            }
-                            systemText.append(sysContent.asText());
-                        }
-                        continue;
-                    }
-
-                    // OpenAI role=tool → Anthropic user + tool_result，保留 tool_call_id 供 Bedrock glm-5 转换
-                    if ("tool".equals(role)) {
-                        appendOpenAiToolMessageAsAnthropic(messages, msg);
-                        continue;
-                    }
-
-                    // OpenAI assistant.tool_calls → Anthropic assistant + tool_use 内容块
-                    if ("assistant".equals(role) && hasOpenAiToolCalls(msg)) {
-                        appendOpenAiAssistantToolCallsAsAnthropic(messages, msg);
-                        continue;
-                    }
-
-                    ObjectNode convertedMsg = messages.addObject();
-                    convertedMsg.put("role", role);
-
-                    JsonNode content = msg.get("content");
-                    if (content != null) {
-                        if (content.isTextual()) {
-                            convertedMsg.put("content", content.asText());
-                        } else if (content.isArray()) {
-                            // 逐块翻译 OpenAI content 块为 Anthropic 格式：
-                            // - text 原样保留
-                            // - image_url 拆成 Anthropic image 块（data URI → base64，http(s) → url）
-                            // 其他不认识的类型原样透传，由上游校验
-                            ArrayNode anthropicContent = convertedMsg.putArray("content");
-                            for (JsonNode block : content) {
-                                anthropicContent.add(convertContentBlock(block));
-                            }
-                        }
-                    }
-                }
-                if (systemText.length() > 0) {
-                    anthropic.put("system", systemText.toString());
-                }
-            }
-
-            // max_tokens
-            if (root.has("max_tokens")) {
-                anthropic.put("max_tokens", root.get("max_tokens").asInt());
-            } else {
-                anthropic.put("max_tokens", 4096); // 默认值
-            }
-
-            // temperature
-            if (root.has("temperature")) {
-                anthropic.put("temperature", root.get("temperature").asDouble());
-            }
-
-            // top_p
-            if (root.has("top_p")) {
-                anthropic.put("top_p", root.get("top_p").asDouble());
-            }
-
-            // stop
-            if (root.has("stop")) {
-                anthropic.set("stop_sequences", root.get("stop"));
-            }
-
-            // stream
-            if (root.has("stream")) {
-                anthropic.put("stream", root.get("stream").asBoolean());
-            }
-
-            // tools (function calling)
-            if (root.has("tools")) {
-                ArrayNode tools = anthropic.putArray("tools");
-                for (JsonNode tool : root.get("tools")) {
-                    ObjectNode convertedTool = tools.addObject();
-                    String toolType = tool.path("type").asText();
-                    if ("function".equals(toolType)) {
-                        convertedTool.put("name", tool.path("function").path("name").asText());
-                        if (tool.path("function").has("description")) {
-                            convertedTool.put("description", tool.path("function").path("description").asText());
-                        }
-                        if (tool.path("function").has("parameters")) {
-                            convertedTool.set("input_schema", tool.path("function").get("parameters"));
-                        }
-                    }
-                }
-            }
-
-            return objectMapper.writeValueAsString(anthropic);
+            String stripped = AnthropicMessageImageStripper.stripImageBlocks(
+                    objectMapper, body, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
+            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
+            return stripped;
         } catch (Exception e) {
-            log.warn("Failed to convert OpenAI request to Anthropic format: {}", e.getMessage());
+            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
+                    model, requestId, e.getMessage());
             return null;
         }
     }
 
-    /** 判断 OpenAI assistant 消息是否含非空 tool_calls。 */
-    private static boolean hasOpenAiToolCalls(JsonNode msg) {
-        JsonNode toolCalls = msg.get("tool_calls");
-        return toolCalls != null && toolCalls.isArray() && !toolCalls.isEmpty();
+    /** 合并 SSE 心跳：主流结束（或出错/取消）后心跳随之停止。 */
+    private Flux<ServerSentEvent<String>> withHeartbeat(Flux<ServerSentEvent<String>> flux) {
+        Flux<ServerSentEvent<String>> heartbeatFlux = Flux
+                .interval(SSE_HEARTBEAT_INTERVAL)
+                .map(i -> ServerSentEvent.<String>builder().comment("ping").build());
+        return flux.publish(shared -> Flux.merge(
+                shared,
+                heartbeatFlux.takeUntilOther(shared.ignoreElements())
+        ));
     }
 
-    /**
-     * OpenAI {@code role:tool} 转为 Anthropic user message + {@code tool_result} 块。
-     * 缺 {@code tool_call_id} 时降级为 user 文本，避免 Bedrock 收到缺字段的 tool 消息。
-     */
-    private void appendOpenAiToolMessageAsAnthropic(ArrayNode messages, JsonNode msg) {
-        String toolCallId = msg.path("tool_call_id").asText("");
-        JsonNode content = msg.get("content");
-        if (toolCallId.isBlank()) {
-            ObjectNode userMsg = messages.addObject();
-            userMsg.put("role", "user");
-            userMsg.put("content", openAiMessageContentToText(content));
-            return;
-        }
-        ObjectNode userMsg = messages.addObject();
-        userMsg.put("role", "user");
-        ArrayNode blocks = userMsg.putArray("content");
-        ObjectNode toolResult = blocks.addObject();
-        toolResult.put("type", "tool_result");
-        toolResult.put("tool_use_id", toolCallId);
-        if (content == null || content.isNull()) {
-            toolResult.put("content", " ");
-        } else if (content.isTextual()) {
-            String text = content.asText();
-            toolResult.put("content", text.isBlank() ? " " : text);
-        } else {
-            toolResult.set("content", content);
-        }
-    }
-
-    /**
-     * OpenAI assistant {@code tool_calls} 转为 Anthropic assistant + {@code tool_use} 内容块。
-     */
-    private void appendOpenAiAssistantToolCallsAsAnthropic(ArrayNode messages, JsonNode msg) {
-        ObjectNode assistantMsg = messages.addObject();
-        assistantMsg.put("role", "assistant");
-        ArrayNode anthropicContent = assistantMsg.putArray("content");
-
-        JsonNode content = msg.get("content");
-        if (content != null && content.isTextual() && !content.asText().isBlank()) {
-            ObjectNode textBlock = anthropicContent.addObject();
-            textBlock.put("type", "text");
-            textBlock.put("text", content.asText());
-        } else if (content != null && content.isArray()) {
-            for (JsonNode block : content) {
-                anthropicContent.add(convertContentBlock(block));
-            }
-        }
-
-        for (JsonNode call : msg.get("tool_calls")) {
-            ObjectNode toolUse = anthropicContent.addObject();
-            toolUse.put("type", "tool_use");
-            toolUse.put("id", call.path("id").asText());
-            toolUse.put("name", call.at("/function/name").asText());
-            JsonNode args = call.at("/function/arguments");
-            if (args.isTextual()) {
-                try {
-                    toolUse.set("input", objectMapper.readTree(args.asText()));
-                } catch (Exception e) {
-                    toolUse.putObject("input");
-                }
-            } else if (args.isObject()) {
-                toolUse.set("input", args);
-            } else {
-                toolUse.putObject("input");
-            }
-        }
-    }
-
-    /** 将 OpenAI message content（字符串或块数组）压缩为纯文本。 */
-    private static String openAiMessageContentToText(JsonNode content) {
-        if (content == null || content.isNull()) {
-            return "";
-        }
-        if (content.isTextual()) {
-            return content.asText();
-        }
-        if (content.isArray()) {
-            StringBuilder sb = new StringBuilder();
-            for (JsonNode block : content) {
-                if (block.isTextual()) {
-                    if (!sb.isEmpty()) {
-                        sb.append('\n');
+    /** 流式结束统一记账：记录错误原因，完成/出错时落请求日志。 */
+    private Flux<ServerSentEvent<String>> withStreamAccounting(Flux<ServerSentEvent<String>> flux,
+                                                               ProviderConfig mapping, String personId,
+                                                               String model, String requestId,
+                                                               AtomicInteger inputTokens, AtomicInteger outputTokens,
+                                                               AtomicReference<String> errorRef, Instant start) {
+        return flux
+                .doOnError(e -> {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    errorRef.set(msg);
+                })
+                .doFinally(signal -> {
+                    switch (signal) {
+                        case ON_COMPLETE -> {
+                            log.info("OpenAI SSE completed: id={} personId={} model={} provider={} durationMs={} inputTokens={} outputTokens={}",
+                                    requestId, personId, model, mapping.provider(),
+                                    Duration.between(start, Instant.now()).toMillis(),
+                                    inputTokens.get(), outputTokens.get());
+                            logRequest(personId, mapping, true, null,
+                                    inputTokens.get(), outputTokens.get(), start);
+                        }
+                        case ON_ERROR -> {
+                            log.warn("OpenAI SSE errored: id={} personId={} model={} provider={} durationMs={} error={}",
+                                    requestId, personId, model, mapping.provider(),
+                                    Duration.between(start, Instant.now()).toMillis(),
+                                    errorRef.get());
+                            logRequest(personId, mapping, false, errorRef.get(),
+                                    inputTokens.get(), outputTokens.get(), start);
+                        }
+                        case CANCEL -> log.info("OpenAI SSE cancelled: id={} personId={} model={} durationMs={}",
+                                requestId, personId, model,
+                                Duration.between(start, Instant.now()).toMillis());
+                        default -> {
+                        }
                     }
-                    sb.append(block.asText());
-                } else if (block.isObject() && "text".equals(block.path("type").asText())) {
-                    if (!sb.isEmpty()) {
-                        sb.append('\n');
-                    }
-                    sb.append(block.path("text").asText());
-                }
-            }
-            return sb.toString();
-        }
-        return content.asText("");
+                });
     }
 
-    /**
-     * 将单个 OpenAI content 块翻译为 Anthropic content 块。
-     * - text: 原样保留
-     * - image_url (data URI): → image / source.type=base64，拆出 media_type 与 base64 data
-     * - image_url (http/https): → image / source.type=url
-     * - 其他: 原样透传，交由上游校验
-     */
-    private JsonNode convertContentBlock(JsonNode block) {
-        String type = block.path("type").asText();
-        if ("image_url".equals(type)) {
-            String url = block.path("image_url").path("url").asText("");
-            int commaIdx = url.indexOf(',');
-            if (url.startsWith("data:") && commaIdx > 0) {
-                // data:image/png;base64,XXXX → media_type=image/png, data=XXXX
-                String header = url.substring(5, commaIdx); // 形如 image/png;base64
-                int semiIdx = header.indexOf(';');
-                String mediaType = semiIdx > 0 ? header.substring(0, semiIdx) : header;
-                String data = url.substring(commaIdx + 1);
-                ObjectNode imageBlock = objectMapper.createObjectNode();
-                imageBlock.put("type", "image");
-                ObjectNode source = imageBlock.putObject("source");
-                source.put("type", "base64");
-                source.put("media_type", mediaType);
-                source.put("data", data);
-                return imageBlock;
-            } else if (url.startsWith("http://") || url.startsWith("https://")) {
-                ObjectNode imageBlock = objectMapper.createObjectNode();
-                imageBlock.put("type", "image");
-                ObjectNode source = imageBlock.putObject("source");
-                source.put("type", "url");
-                source.put("url", url);
-                return imageBlock;
-            }
-        }
-        return block;
+    /** 构建 SSE 流式响应。 */
+    private Mono<ServerResponse> sseResponse(Flux<ServerSentEvent<String>> flux) {
+        return ServerResponse.ok()
+                .contentType(MediaType.TEXT_EVENT_STREAM)
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .body(BodyInserters.fromServerSentEvents(flux));
     }
 
     /**
