@@ -8,26 +8,40 @@ import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 /**
- * 基于滑动计数窗口的限流器实现。
- * 每个用户维护一个分钟级窗口，窗口内计数超过 RPM 阈值时拒绝请求。
- * 用户窗口在 5 分钟无访问后自动过期清理。
+ * 基于加权滑动窗口计数的限流器实现。
+ * 预估值 = 当前窗口计数 + 上一窗口计数 × (1 - 当前窗口已过去比例)，
+ * 相比固定窗口可抑制窗口边界处约 2×RPM 的突发流量。
+ * 每个用户仅保存两个计数器（O(1) 内存），窗口在 5 分钟无访问后自动过期清理。
+ *
+ * 注意：限流为单实例内存实现，K8s 多副本部署时实际限额为 副本数 × RPM。
  */
 @Component
 public class RateLimiterImpl implements RateLimiter {
 
     /** 用户窗口过期时间（分钟），无访问时自动清理 */
     private static final int WINDOW_EXPIRE_MINUTES = 5;
+    /** 窗口长度（毫秒），固定一分钟 */
+    private static final long WINDOW_MILLIS = 60_000;
 
     private final RateLimitConfigHolder configHolder;
 
     /** 用户级别的限流窗口缓存，key 为用户名 */
     private final Cache<String, UserRateWindow> userWindows;
 
+    /** 毫秒时钟，测试可替换以控制窗口边界 */
+    private final LongSupplier millisSupplier;
+
     public RateLimiterImpl(RateLimitConfigHolder configHolder) {
+        this(configHolder, System::currentTimeMillis);
+    }
+
+    /** 测试专用：注入可控时钟 */
+    RateLimiterImpl(RateLimitConfigHolder configHolder, LongSupplier millisSupplier) {
         this.configHolder = configHolder;
+        this.millisSupplier = millisSupplier;
         this.userWindows = Caffeine.newBuilder()
                 .expireAfterAccess(WINDOW_EXPIRE_MINUTES, TimeUnit.MINUTES)
                 .build();
@@ -35,34 +49,39 @@ public class RateLimiterImpl implements RateLimiter {
 
     @Override
     public Mono<Boolean> tryAcquire(String username) {
-        // 获取或创建用户限流窗口
         UserRateWindow window = userWindows.get(username, k -> new UserRateWindow());
-        // 计算当前分钟窗口的标识（Unix 时间戳 / 60000）
-        long now = System.currentTimeMillis() / 60_000;
+        long nowMs = millisSupplier.getAsLong();
+        long now = nowMs / WINDOW_MILLIS;
 
         synchronized (window) {
-            // 进入新窗口时重置计数器
+            // 窗口滚动：上一窗口计数仅在相邻时参与加权，跨多窗口空闲后清零
             if (window.windowStart != now) {
-                window.counter.set(0);
+                window.previousCount = (window.windowStart == now - 1) ? window.currentCount : 0;
+                window.currentCount = 0;
                 window.windowStart = now;
             }
-            long count = window.counter.incrementAndGet();
+            double elapsedRatio = (nowMs % WINDOW_MILLIS) / (double) WINDOW_MILLIS;
+            double estimated = window.previousCount * (1 - elapsedRatio) + window.currentCount + 1;
             int rpm = configHolder.getDefaultRpm();
-            if (count > rpm) {
+            if (estimated > rpm) {
                 return Mono.error(new RateLimitExceededException(
                         "Rate limit exceeded for user '" + username + "': " + rpm + " RPM"));
             }
+            window.currentCount++;
         }
         return Mono.just(true);
     }
 
     /**
-     * 用户限流窗口，记录当前分钟窗口的起始时间和请求计数
+     * 用户限流窗口：上一分钟窗口计数（用于加权）+ 当前分钟窗口计数。
+     * 所有字段仅在 synchronized(window) 内访问。
      */
     private static class UserRateWindow {
-        /** 当前窗口内的请求计数 */
-        final AtomicLong counter = new AtomicLong(0);
+        /** 上一分钟窗口的请求总数 */
+        long previousCount;
+        /** 当前分钟窗口已计数请求数 */
+        long currentCount;
         /** 当前窗口起始时间（分钟级 Unix 时间戳） */
-        volatile long windowStart;
+        long windowStart;
     }
 }
