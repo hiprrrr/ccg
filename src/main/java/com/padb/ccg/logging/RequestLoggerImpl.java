@@ -13,7 +13,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 请求日志记录器实现，采用 fire-and-forget 异步模式。
@@ -48,9 +47,6 @@ public class RequestLoggerImpl implements RequestLogger {
         return t;
     });
 
-    /** 运行状态标记 */
-    private final AtomicBoolean running = new AtomicBoolean(true);
-
     private final LogBatchWriter batchWriter;
 
     public RequestLoggerImpl(LogBatchWriter batchWriter) {
@@ -83,7 +79,6 @@ public class RequestLoggerImpl implements RequestLogger {
 
     @Override
     public Mono<Void> shutdown() {
-        running.set(false);
         scheduler.shutdown();
         try {
             // 等待定时任务终止

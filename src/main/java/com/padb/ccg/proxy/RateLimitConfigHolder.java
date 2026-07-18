@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 限流配置持有者，线程安全地维护当前生效的默认 RPM 值。
- * 使用 {@link AtomicInteger} 支持配置热更新。
+ * 当前仅在启动时从配置读取一次；如需热更新，需为 Apollo 变更事件补充 setter 入口。
  */
 @Component
 public class RateLimitConfigHolder {

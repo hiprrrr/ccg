@@ -8,6 +8,8 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * 从 other-provider 的 {@code api-keys} 中均匀随机选取一个上游 Key。
  * <p>使用 {@link ThreadLocalRandom#nextInt(int)}，在有效 key 池内每个条目被选中的概率相等。</p>
+ * <p>TODO: 当前无故障转移——某个 key 失效（401/欠费）时约 1/N 的请求会持续失败，
+ * 后续应在上游返回鉴权类错误时换 key 重试并临时剔除失效 key。</p>
  */
 public final class UpstreamAccountSelector {
 

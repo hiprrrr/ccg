@@ -53,7 +53,6 @@ public class GlobalErrorHandler implements WebExceptionHandler {
             errorType = switch (ge.getHttpStatus()) {
                 case 403 -> "permission_error";
                 case 429 -> "rate_limit_error";
-                case 502 -> "api_error";
                 default -> "api_error";
             };
         } else if (cause instanceof TimeoutException) {
