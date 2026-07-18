@@ -87,6 +87,30 @@ class UpstreamAccountSelectorTest {
     }
 
     @Test
+    void shouldExcludeTriedKeys() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("key-1", "key-2", "key-3"), "openai");
+
+        // 排除两个 key 后，必须命中剩余的那个
+        Set<String> picked = IntStream.range(0, 30)
+                .mapToObj(i -> UpstreamAccountSelector.select(provider, Set.of("key-1", "key-3")).apiKey())
+                .collect(Collectors.toSet());
+
+        assertEquals(Set.of("key-2"), picked);
+    }
+
+    @Test
+    void shouldFailWhenAllKeysExcluded() {
+        var provider = new OtherProviderItem(
+                "huawei", "https://example.com/anthropic",
+                List.of("key-1", "key-2"), "openai");
+
+        assertThrows(ProviderException.class,
+                () -> UpstreamAccountSelector.select(provider, Set.of("key-1", "key-2")));
+    }
+
+    @Test
     void awsProviderNameIsRecognized() {
         assertTrue(ProviderNames.isAws("aws"));
         assertTrue(ProviderNames.isAws("AWS"));

@@ -21,11 +21,15 @@ import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 /**
  * HTTP 透传代理：按 {@code other-providers} 配置替换 base-url 与 api-key。
@@ -61,7 +65,6 @@ public class HttpPassthroughProxyHandler {
                                                   AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                   String username, String model, String traceId) {
         OtherProviderItem provider = otherProvidersRegistry.require(mapping.provider());
-        UpstreamAccountSelector.AccountSelection account = UpstreamAccountSelector.select(provider);
         final String correlationId = normalizeTraceId(traceId);
         // 优先尊重请求体 stream；未声明时再回退到 capabilities 中的 stream/streaming
         boolean streaming = resolveStreaming(mapping, requestBody);
@@ -70,10 +73,10 @@ public class HttpPassthroughProxyHandler {
         // anthropic 或未配置（透传）则按 Anthropic 协议直连上游。
         if (provider.isOpenAiFormat()) {
             return forwardAnthropicViaOpenAiUpstream(provider, mapping, requestBody, inputTokens, outputTokens,
-                    username, model, correlationId, streaming, account);
+                    username, model, correlationId, streaming);
         }
         return forwardAnthropicUpstream(provider, mapping, requestBody, inputTokens, outputTokens,
-                username, model, correlationId, streaming, account);
+                username, model, correlationId, streaming);
     }
 
     /**
@@ -89,7 +92,6 @@ public class HttpPassthroughProxyHandler {
                             + provider.name() + "' (current=" + provider.resolvedApiFormat() + ")"));
         }
 
-        UpstreamAccountSelector.AccountSelection account = UpstreamAccountSelector.select(provider);
         final String correlationId = normalizeTraceId(traceId);
         boolean streaming = isStreamRequested(openAiBody);
         String body;
@@ -103,20 +105,20 @@ public class HttpPassthroughProxyHandler {
         log.info("HTTP passthrough OpenAI: provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
                 provider.name(), correlationId, username, model, mapping.upstreamModelId(), streaming);
 
+        Set<String> triedKeys = new HashSet<>();
         if (streaming) {
-            return invokeOpenAiStreaming(provider, body, account, inputTokens, outputTokens,
-                    correlationId, username, model, false);
+            return withKeyFailover(provider, triedKeys, account -> invokeOpenAiStreaming(
+                    provider, body, account, inputTokens, outputTokens, correlationId, username, model, false));
         }
-        return invokeOpenAiNonStreamingAsSingleEvent(provider, body, account, inputTokens, outputTokens,
-                correlationId, username, model);
+        return withKeyFailover(provider, triedKeys, account -> invokeOpenAiNonStreamingAsSingleEvent(
+                provider, body, account, inputTokens, outputTokens, correlationId, username, model));
     }
 
     private Flux<ServerSentEvent<String>> forwardAnthropicUpstream(OtherProviderItem provider,
                                                                    ProviderConfig mapping, String requestBody,
                                                                    AtomicInteger inputTokens, AtomicInteger outputTokens,
                                                                    String username, String model, String traceId,
-                                                                   boolean streaming,
-                                                                   UpstreamAccountSelector.AccountSelection account) {
+                                                                   boolean streaming) {
         String body;
         try {
             body = prepareAnthropicRequestBody(requestBody, mapping.upstreamModelId(), streaming,
@@ -129,10 +131,13 @@ public class HttpPassthroughProxyHandler {
         log.info("HTTP passthrough Anthropic: provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
                 provider.name(), traceId, username, model, mapping.upstreamModelId(), streaming);
 
+        Set<String> triedKeys = new HashSet<>();
         if (streaming) {
-            return invokeAnthropicStreaming(provider, body, account, inputTokens, outputTokens, traceId, username, model);
+            return withKeyFailover(provider, triedKeys, account -> invokeAnthropicStreaming(
+                    provider, body, account, inputTokens, outputTokens, traceId, username, model));
         }
-        return invokeAnthropicNonStreaming(provider, body, account, model, inputTokens, outputTokens, traceId, username);
+        return withKeyFailover(provider, triedKeys, account -> invokeAnthropicNonStreaming(
+                provider, body, account, model, inputTokens, outputTokens, traceId, username));
     }
 
     private Flux<ServerSentEvent<String>> forwardAnthropicViaOpenAiUpstream(OtherProviderItem provider,
@@ -140,8 +145,7 @@ public class HttpPassthroughProxyHandler {
                                                                              AtomicInteger inputTokens,
                                                                              AtomicInteger outputTokens,
                                                                              String username, String model,
-                                                                             String traceId, boolean streaming,
-                                                                             UpstreamAccountSelector.AccountSelection account) {
+                                                                             String traceId, boolean streaming) {
         String openAiBody;
         try {
             openAiBody = AnthropicOpenAiRequestConverter.toOpenAiChat(
@@ -154,12 +158,13 @@ public class HttpPassthroughProxyHandler {
         log.info("HTTP passthrough OpenAI upstream (Anthropic client): provider={} traceId={} user={} userModel={} upstreamModel={} streaming={}",
                 provider.name(), traceId, username, model, mapping.upstreamModelId(), streaming);
 
+        Set<String> triedKeys = new HashSet<>();
         if (streaming) {
-            return invokeOpenAiStreaming(provider, openAiBody, account, inputTokens, outputTokens,
-                    traceId, username, model, true);
+            return withKeyFailover(provider, triedKeys, account -> invokeOpenAiStreaming(
+                    provider, openAiBody, account, inputTokens, outputTokens, traceId, username, model, true));
         }
-        return invokeOpenAiNonStreamingAsAnthropicSse(provider, openAiBody, account, model,
-                inputTokens, outputTokens, traceId, username);
+        return withKeyFailover(provider, triedKeys, account -> invokeOpenAiNonStreamingAsAnthropicSse(
+                provider, openAiBody, account, model, inputTokens, outputTokens, traceId, username));
     }
 
     private Flux<ServerSentEvent<String>> invokeAnthropicStreaming(OtherProviderItem provider, String body,
@@ -378,7 +383,42 @@ public class HttpPassthroughProxyHandler {
         return response.bodyToMono(String.class)
                 .defaultIfEmpty("upstream error")
                 .flatMap(msg -> Mono.error(new ProviderException(
-                        "Provider '" + provider.name() + "' error " + response.statusCode().value() + ": " + msg)));
+                        "Provider '" + provider.name() + "' error " + response.statusCode().value() + ": " + msg,
+                        response.statusCode().value())));
+    }
+
+    /**
+     * 上游 key 故障转移包装：上游返回鉴权/配额类错误（401/403/429）且尚未向下游发出任何事件时，
+     * 排除已失败的 key 换用下一个重试；已开始输出事件的流不能安全重试，直接透传错误。
+     */
+    private Flux<ServerSentEvent<String>> withKeyFailover(
+            OtherProviderItem provider, Set<String> triedKeys,
+            Function<UpstreamAccountSelector.AccountSelection, Flux<ServerSentEvent<String>>> invoker) {
+        UpstreamAccountSelector.AccountSelection account = UpstreamAccountSelector.select(provider, triedKeys);
+        AtomicBoolean emitted = new AtomicBoolean(false);
+        return invoker.apply(account)
+                .doOnNext(event -> emitted.set(true))
+                .onErrorResume(error -> {
+                    if (emitted.get() || !isFailoverable(error)) {
+                        return Flux.error(error);
+                    }
+                    triedKeys.add(account.apiKey());
+                    if (triedKeys.size() >= provider.eligibleApiKeys().size()) {
+                        return Flux.error(error);
+                    }
+                    log.warn("Provider '{}' key failover after upstream error (tried={}): {}",
+                            provider.name(), triedKeys.size(), error.getMessage());
+                    return withKeyFailover(provider, triedKeys, invoker);
+                });
+    }
+
+    /** 仅鉴权/配额类上游错误值得换 key 重试 */
+    private static boolean isFailoverable(Throwable error) {
+        if (error instanceof ProviderException pe) {
+            int status = pe.upstreamStatus();
+            return status == 401 || status == 403 || status == 429;
+        }
+        return false;
     }
 
     /**
