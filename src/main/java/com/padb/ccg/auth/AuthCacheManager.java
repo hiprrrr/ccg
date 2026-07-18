@@ -1,6 +1,6 @@
 package com.padb.ccg.auth;
 
-import com.padb.ccg.core.exception.ProviderException;
+import com.padb.ccg.core.exception.AuthPlatformUnavailableException;
 import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
 import com.github.benmanes.caffeine.cache.Cache;
@@ -159,7 +159,7 @@ public class AuthCacheManager {
                             log.warn("Auth platform error for token hash={}", token.hashCode(), error);
                             inflight.remove(token, holder);
                             holder.future().completeExceptionally(
-                                    new ProviderException("Unable to verify authorization: auth platform unavailable"));
+                                    new AuthPlatformUnavailableException("Unable to verify authorization: auth platform unavailable"));
                         });
     }
 

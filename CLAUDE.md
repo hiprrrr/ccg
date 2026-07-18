@@ -31,7 +31,7 @@
 **代码目录**: `/Users/hipr/Work/project/ccgeteway`
 
 **技术约束**:
-- Java 21, Spring Boot 3.x + WebFlux (Reactor), Maven 多模块
+- Java 21, Spring Boot 3.x + WebFlux (Reactor), Maven 单模块
 - 配置中心: Apollo（单 namespace `application`）
 - 缓存: Caffeine
 - 数据库: MySQL（仅用于请求日志）
@@ -57,7 +57,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **ccg** (1484 symbols, 3401 relationships, 128 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **ccg** (1529 symbols, 3571 relationships, 132 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

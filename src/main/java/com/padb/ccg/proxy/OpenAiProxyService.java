@@ -467,7 +467,9 @@ public class OpenAiProxyService {
                     return ServerResponse.ok()
                             .contentType(MediaType.APPLICATION_JSON)
                             .bodyValue(json);
-                });
+                })
+                // 上游返回空响应时 next() 得到空 Mono，函数式端点会回 404，这里转为明确的 502
+                .switchIfEmpty(respondOpenAiError(502, "api_error", "Empty response from upstream provider"));
     }
 
     /**
@@ -1038,6 +1040,9 @@ public class OpenAiProxyService {
         }
         if (cause instanceof com.padb.ccg.core.exception.RateLimitExceededException rle) {
             return respondOpenAiError(429, "rate_limit_error", rle.getMessage());
+        }
+        if (cause instanceof com.padb.ccg.core.exception.AuthPlatformUnavailableException apue) {
+            return respondOpenAiError(503, "api_error", apue.getMessage());
         }
         if (cause instanceof com.padb.ccg.core.exception.ProviderException pe) {
             return respondOpenAiError(502, "api_error", pe.getMessage());

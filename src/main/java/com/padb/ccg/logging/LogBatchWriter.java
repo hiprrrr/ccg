@@ -80,9 +80,14 @@ public class LogBatchWriter {
                 ps.setInt(9, entry.durationMs());
                 ps.setTimestamp(10, Timestamp.from(entry.createdAt()));
             });
-            writeUsageBatch(entries);
         } catch (Exception e) {
             log.error("Failed to write batch of {} log entries", entries.size(), e);
+        }
+        // 用量聚合与明细日志解耦：明细插入失败不应牵连 token 用量统计
+        try {
+            writeUsageBatch(entries);
+        } catch (Exception e) {
+            log.error("Failed to write token usage batch of {} log entries", entries.size(), e);
         }
     }
 

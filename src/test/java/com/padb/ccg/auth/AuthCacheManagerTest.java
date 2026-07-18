@@ -1,6 +1,5 @@
 package com.padb.ccg.auth;
 
-import com.padb.ccg.core.exception.ProviderException;
 import com.padb.ccg.core.model.AuthResult;
 import com.padb.ccg.core.model.ModelAuthorization;
 import org.junit.jupiter.api.BeforeEach;
@@ -100,7 +99,7 @@ class AuthCacheManagerTest {
                 .thenReturn(Mono.error(new RuntimeException("platform down")));
 
         StepVerifier.create(cacheManager.getAuthorization("token1", "claude-opus"))
-                .expectErrorMatches(e -> e instanceof ProviderException
+                .expectErrorMatches(e -> e instanceof com.padb.ccg.core.exception.AuthPlatformUnavailableException
                         && e.getMessage().contains("Unable to verify authorization"))
                 .verify();
     }

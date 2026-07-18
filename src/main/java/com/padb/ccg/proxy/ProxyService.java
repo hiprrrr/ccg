@@ -390,6 +390,9 @@ public class ProxyService {
         if (cause instanceof com.padb.ccg.core.exception.RateLimitExceededException rle) {
             return respondError(429, "rate_limit_error", rle.getMessage());
         }
+        if (cause instanceof com.padb.ccg.core.exception.AuthPlatformUnavailableException apue) {
+            return respondError(503, "api_error", apue.getMessage());
+        }
         if (cause instanceof com.padb.ccg.core.exception.ProviderException pe) {
             return respondError(502, "api_error", pe.getMessage());
         }
