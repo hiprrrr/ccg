@@ -4,6 +4,7 @@ import com.padb.ccg.core.exception.RateLimitExceededException;
 import com.padb.ccg.core.spi.RateLimiter;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
@@ -34,6 +35,8 @@ public class RateLimiterImpl implements RateLimiter {
     /** 毫秒时钟，测试可替换以控制窗口边界 */
     private final LongSupplier millisSupplier;
 
+    // 类上存在两个构造函数（含测试专用包级构造函数），需显式 @Autowired 指定注入入口
+    @Autowired
     public RateLimiterImpl(RateLimitConfigHolder configHolder) {
         this(configHolder, System::currentTimeMillis);
     }

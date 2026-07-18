@@ -107,11 +107,11 @@ other-providers:
     # 可配 1 个或多个 key；多个时每次请求均匀随机选取，降低单 Key 限流风险
     api-keys:
       - ${HUAWEI_MAAS_API_KEY:}
-  - name: basicrouter
+  - name: kimi
     # 单一 URL、无 anthropic/openai 分叉：不配 api-format，按客户端协议透传
-    base-url: https://api.basicrouter.ai/api
+    base-url: https://api.kimi.com/coding/
     api-keys:
-      - ${BASICROUTER_API_KEY_1:}
+      - ${KIMI_CODING_API_KEY_1:}
 
 # ============================================================================
 # 模型映射：model-name 下声明 provider（aws / other-providers 中的 name）及同级的上游参数
@@ -134,18 +134,9 @@ model-mappings:
       - tools
       - stream
 
-  - model-name: claude-sonnet-5
-    provider: basicrouter
-    upstream-model-id: claude-sonnet-5
-    capabilities:
-      - text
-      - vision
-      - tools
-      - stream
-
-  - model-name: claude-opus-4.8
-    provider: basicrouter
-    upstream-model-id: claude-opus-4.8
+  - model-name: kimi-k3
+    provider: kimi
+    upstream-model-id: k3
     capabilities:
       - text
       - vision
