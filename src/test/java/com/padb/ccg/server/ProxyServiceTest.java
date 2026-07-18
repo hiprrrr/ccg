@@ -127,9 +127,47 @@ class ProxyServiceTest {
                 .uri("/v1/messages")
                 .header("Authorization", "Bearer token1")
                 .header("Content-Type", "application/json")
-                .bodyValue("{\"model\":\"claude-opus-4-7\"}")
+                .bodyValue("{\"model\":\"claude-opus-4-7\",\"stream\":true}")
                 .exchange()
                 .expectStatus().isOk();
+    }
+
+    @Test
+    void shouldReturnCompleteJsonWhenStreamFalse() {
+        var mapping = new ProviderConfig(ProviderNames.AWS, "claude-opus-4-7",
+                "us.anthropic.claude-opus-4-7-v1:0", "us-west-2", java.util.List.of("text"));
+        var authResult = new AuthResult("person1", java.time.Instant.now().plusSeconds(7200),
+                java.util.List.of(new ModelAuthorization("claude-opus-4-7", java.time.Instant.now().plusSeconds(7200))));
+        when(providerRegistry.resolve("claude-opus-4-7")).thenReturn(Optional.of(mapping));
+        when(authService.authorize("token1", "claude-opus-4-7")).thenReturn(Mono.just(authResult));
+        when(rateLimiter.tryAcquire("person1")).thenReturn(Mono.just(true));
+        // 上游非流式调用也会把完整 message 包装成 Anthropic SSE 事件序列
+        when(upstreamRouter.forward(eq(mapping), anyString(), any(), any(), eq("person1"), eq("claude-opus-4-7"), anyString()))
+                .thenReturn(reactor.core.publisher.Flux.just(
+                        sse("{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"claude-opus-4-7\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}"),
+                        sse("{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}"),
+                        sse("{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}"),
+                        sse("{\"type\":\"content_block_stop\",\"index\":0}"),
+                        sse("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"),
+                        sse("{\"type\":\"message_stop\"}")));
+
+        webClient.post()
+                .uri("/v1/messages")
+                .header("x-api-key", "token1")
+                .header("Content-Type", "application/json")
+                .bodyValue("{\"model\":\"claude-opus-4-7\",\"stream\":false}")
+                .exchange()
+                .expectStatus().isOk()
+                .expectHeader().contentType("application/json")
+                .expectBody()
+                .jsonPath("$.type").isEqualTo("message")
+                .jsonPath("$.content[0].text").isEqualTo("hello")
+                .jsonPath("$.stop_reason").isEqualTo("end_turn")
+                .jsonPath("$.usage.output_tokens").isEqualTo(3);
+    }
+
+    private static org.springframework.http.codec.ServerSentEvent<String> sse(String data) {
+        return org.springframework.http.codec.ServerSentEvent.<String>builder().data(data).build();
     }
 
     @Test

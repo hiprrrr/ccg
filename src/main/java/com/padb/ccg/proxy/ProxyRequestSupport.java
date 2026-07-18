@@ -86,6 +86,19 @@ public class ProxyRequestSupport {
                 });
     }
 
+    /** 检测请求体是否声明流式（stream=true）；未声明或解析失败按非流式处理。 */
+    public boolean isStreamRequested(String body) {
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            if (root.has("stream")) {
+                return root.get("stream").asBoolean(false);
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return false;
+    }
+
     /**
      * 判断请求体是否含图片 content 块（Anthropic type=image 或 OpenAI type=image_url）。
      * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。

@@ -1,5 +1,6 @@
 package com.padb.ccg.proxy;
 
+import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.routing.ProviderRegistryImpl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -98,6 +99,9 @@ public class ProxyService {
                     // 发到 /v1/messages，这里统一转成 Anthropic 的 image 块，避免上游 400
                     final String normalizedBody = normalizeImageBlocks(preparedBody);
 
+                    // 是否流式：未声明 stream 按 Anthropic 契约为非流式
+                    boolean streamRequested = support.isStreamRequested(body);
+
                     // 初始化 token 计数器和错误引用
                     var inputTokens = new AtomicInteger(0);
                     var outputTokens = new AtomicInteger(0);
@@ -107,6 +111,10 @@ public class ProxyService {
                     return support.authorizeAndRateLimit(token, model)
                             .flatMap(personId -> {
                                 recordRequestContentPlaceholder(personId, model, body);
+                                if (!streamRequested) {
+                                    return handleNonStreamingRequest(mapping, normalizedBody, personId, model,
+                                            requestId, inputTokens, outputTokens, errorRef, start);
+                                }
                                 // 构建 SSE 流，附加错误捕获和日志记录
                                 Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
                                         .forward(mapping, normalizedBody, inputTokens, outputTokens, personId, model, requestId);
@@ -164,6 +172,47 @@ public class ProxyService {
                             });
                 })
                 .onErrorResume(e -> handleError(e));
+    }
+
+    /**
+     * 处理 stream:false 的非流式请求：聚合上游 Anthropic SSE 事件为完整 message JSON 返回。
+     * 上游链路按请求体 stream 标志走非流式调用（LlmUpstreamRouter 尊重请求体声明），
+     * 这里把事件序列还原为完整 message，符合 Anthropic 非流式响应契约。
+     */
+    private Mono<ServerResponse> handleNonStreamingRequest(ProviderConfig mapping, String body, String personId,
+                                                           String model, String requestId,
+                                                           AtomicInteger inputTokens, AtomicInteger outputTokens,
+                                                           AtomicReference<String> errorRef, Instant start) {
+        var aggregator = new AnthropicSseAggregator(objectMapper);
+        return upstreamRouter.forward(mapping, body, inputTokens, outputTokens, personId, model, requestId)
+                .flatMap(event -> {
+                    String data = event.data();
+                    if (data != null && !data.isEmpty()) {
+                        aggregator.consume(data);
+                    }
+                    return Flux.empty();
+                })
+                .then(Mono.defer(() -> {
+                    log.info("Non-stream response completed: id={} personId={} provider={} model={} durationMs={} inputTokens={} outputTokens={}",
+                            requestId, personId, mapping.provider(), model,
+                            Duration.between(start, Instant.now()).toMillis(),
+                            inputTokens.get(), outputTokens.get());
+                    support.logRequest(personId, mapping, true, null,
+                            inputTokens.get(), outputTokens.get(), start);
+                    try {
+                        return ServerResponse.ok()
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .bodyValue(objectMapper.writeValueAsString(aggregator.buildMessage()));
+                    } catch (Exception e) {
+                        return respondError(500, "api_error", "Failed to serialize response");
+                    }
+                }))
+                .doOnError(e -> {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    errorRef.set(msg);
+                    support.logRequest(personId, mapping, false, msg,
+                            inputTokens.get(), outputTokens.get(), start);
+                });
     }
 
     /**

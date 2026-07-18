@@ -78,7 +78,7 @@ public class OpenAiProxyService {
                     }
 
                     // 检测是否为流式请求
-                    boolean streamRequested = isStreamRequested(body);
+                    boolean streamRequested = support.isStreamRequested(body);
 
                     log.info("OpenAI request accepted: id={} tokenHash={} model={} stream={} bodyChars={}",
                             requestId, token.hashCode(), model, streamRequested, body.length());
@@ -151,7 +151,7 @@ public class OpenAiProxyService {
                         return respondOpenAiError(400, "invalid_request_error", "Missing model in request body");
                     }
 
-                    boolean streamRequested = isStreamRequested(body);
+                    boolean streamRequested = support.isStreamRequested(body);
                     String convertedBody = OpenAiResponsesRequestConverter.toAnthropic(objectMapper, body);
                     if (convertedBody == null) {
                         return respondOpenAiError(400, "invalid_request_error", "Invalid Responses API request body");
@@ -443,21 +443,6 @@ public class OpenAiProxyService {
                         return respondOpenAiError(500, "internal_error", "Failed to serialize response");
                     }
                 }));
-    }
-
-    /**
-     * 检测是否为流式请求
-     */
-    private boolean isStreamRequested(String body) {
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            if (root.has("stream")) {
-                return root.get("stream").asBoolean(false);
-            }
-        } catch (Exception e) {
-            // ignore
-        }
-        return false;
     }
 
     /** 合并 SSE 心跳：主流结束（或出错/取消）后心跳随之停止。 */
