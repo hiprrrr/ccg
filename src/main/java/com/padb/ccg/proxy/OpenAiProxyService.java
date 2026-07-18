@@ -1,11 +1,7 @@
 package com.padb.ccg.proxy;
 
 import com.padb.ccg.core.model.ProviderConfig;
-import com.padb.ccg.core.model.RequestLogEntry;
-import com.padb.ccg.core.spi.RateLimiter;
-import com.padb.ccg.core.spi.RequestLogger;
 import com.padb.ccg.routing.ProviderRegistryImpl;
-import com.padb.ccg.auth.AuthService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -43,25 +39,20 @@ public class OpenAiProxyService {
     private static final Logger log = LoggerFactory.getLogger(OpenAiProxyService.class);
     private static final Duration SSE_HEARTBEAT_INTERVAL = Duration.ofSeconds(15);
 
-    private final AuthService authService;
-    private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
     private final LlmUpstreamRouter upstreamRouter;
     private final OtherProvidersRegistry otherProvidersRegistry;
-    private final RequestLogger requestLogger;
+    private final ProxyRequestSupport support;
     private final ObjectMapper objectMapper;
 
-    public OpenAiProxyService(AuthService authService, RateLimiter rateLimiter,
-                              ProviderRegistryImpl providerRegistry,
+    public OpenAiProxyService(ProviderRegistryImpl providerRegistry,
                               LlmUpstreamRouter upstreamRouter, OtherProvidersRegistry otherProvidersRegistry,
-                              RequestLogger requestLogger,
+                              ProxyRequestSupport support,
                               ObjectMapper objectMapper) {
-        this.authService = authService;
-        this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
         this.upstreamRouter = upstreamRouter;
         this.otherProvidersRegistry = otherProvidersRegistry;
-        this.requestLogger = requestLogger;
+        this.support = support;
         this.objectMapper = objectMapper;
     }
 
@@ -73,7 +64,7 @@ public class OpenAiProxyService {
         String requestId = UUID.randomUUID().toString().substring(0, 8);
 
         // 从请求头提取认证 Token
-        String token = extractAuthToken(request);
+        String token = ProxyRequestSupport.extractAuthToken(request);
         if (token == null || token.isBlank()) {
             return respondOpenAiError(401, "invalid_request_error", "Missing API key");
         }
@@ -81,7 +72,7 @@ public class OpenAiProxyService {
         return request.bodyToMono(String.class)
                 .flatMap(body -> {
                     // 从请求体提取模型名称
-                    String model = extractModel(body);
+                    String model = support.extractModel(body);
                     if (model == null) {
                         return respondOpenAiError(400, "invalid_request_error", "Missing model in request body");
                     }
@@ -106,7 +97,7 @@ public class OpenAiProxyService {
                     } else {
                         String convertedBody = OpenAiChatRequestConverter.toAnthropic(objectMapper, body);
                         String anthropicBody = convertedBody != null ? convertedBody : body;
-                        String stripped = stripImagesIfNonVision(mapping, anthropicBody, model, requestId);
+                        String stripped = support.stripImagesIfNonVision(mapping, anthropicBody, model, requestId);
                         if (stripped == null) {
                             return respondOpenAiError(400, "invalid_request_error",
                                     "Model '" + model + "' does not support image input");
@@ -120,7 +111,7 @@ public class OpenAiProxyService {
                     var errorRef = new AtomicReference<String>(null);
 
                     // 认证 → 限流 → 代理转发
-                    return authorizeAndRateLimit(token, model)
+                    return support.authorizeAndRateLimit(token, model)
                             .flatMap(personId -> {
                                 if (openAiPassthrough) {
                                     if (streamRequested) {
@@ -148,14 +139,14 @@ public class OpenAiProxyService {
         Instant start = Instant.now();
         String requestId = UUID.randomUUID().toString().substring(0, 8);
 
-        String token = extractAuthToken(request);
+        String token = ProxyRequestSupport.extractAuthToken(request);
         if (token == null || token.isBlank()) {
             return respondOpenAiError(401, "invalid_request_error", "Missing API key");
         }
 
         return request.bodyToMono(String.class)
                 .flatMap(body -> {
-                    String model = extractModel(body);
+                    String model = support.extractModel(body);
                     if (model == null) {
                         return respondOpenAiError(400, "invalid_request_error", "Missing model in request body");
                     }
@@ -176,7 +167,7 @@ public class OpenAiProxyService {
                     }
                     var mapping = mappingOpt.get();
 
-                    String stripped = stripImagesIfNonVision(mapping, convertedBody, model, requestId);
+                    String stripped = support.stripImagesIfNonVision(mapping, convertedBody, model, requestId);
                     if (stripped == null) {
                         return respondOpenAiError(400, "invalid_request_error",
                                 "Model '" + model + "' does not support image input");
@@ -187,7 +178,7 @@ public class OpenAiProxyService {
                     var outputTokens = new AtomicInteger(0);
                     var errorRef = new AtomicReference<String>(null);
 
-                    return authorizeAndRateLimit(token, model)
+                    return support.authorizeAndRateLimit(token, model)
                             .flatMap(personId -> {
                                 if (streamRequested) {
                                     return handleResponsesStreamingRequest(mapping, bodyToForward, personId, model,
@@ -280,7 +271,7 @@ public class OpenAiProxyService {
                             requestId, personId, model,
                             Duration.between(start, Instant.now()).toMillis(),
                             inTok, outTok);
-                    logRequest(personId, mapping, true, null, inTok, outTok, start);
+                    support.logRequest(personId, mapping, true, null, inTok, outTok, start);
 
                     try {
                         return ServerResponse.ok()
@@ -335,7 +326,7 @@ public class OpenAiProxyService {
                             requestId, personId, model, mapping.provider(),
                             Duration.between(start, Instant.now()).toMillis(),
                             inputTokens.get(), outputTokens.get());
-                    logRequest(personId, mapping, true, null,
+                    support.logRequest(personId, mapping, true, null,
                             inputTokens.get(), outputTokens.get(), start);
                     return ServerResponse.ok()
                             .contentType(MediaType.APPLICATION_JSON)
@@ -440,7 +431,7 @@ public class OpenAiProxyService {
                             requestId, personId, model,
                             Duration.between(start, Instant.now()).toMillis(),
                             inputTokens.get(), outputTokens.get());
-                    logRequest(personId, mapping, true, null,
+                    support.logRequest(personId, mapping, true, null,
                             inputTokens.get(), outputTokens.get(), start);
 
                     try {
@@ -467,36 +458,6 @@ public class OpenAiProxyService {
             // ignore
         }
         return false;
-    }
-
-    /** 认证 → 限流，返回 personId。 */
-    private Mono<String> authorizeAndRateLimit(String token, String model) {
-        return authService.authorize(token, model)
-                .flatMap(authResult -> {
-                    String personId = authResult.personId();
-                    return rateLimiter.tryAcquire(personId)
-                            .thenReturn(personId);
-                });
-    }
-
-    /**
-     * 非视觉模型且请求体含图片块时剥离为占位文本；视觉模型或无图片时原样返回。
-     * 剥离失败返回 null，由调用方转为 400 错误响应。
-     */
-    private String stripImagesIfNonVision(ProviderConfig mapping, String body, String model, String requestId) {
-        if (mapping.supportsVision() || !hasImageContent(body)) {
-            return body;
-        }
-        try {
-            String stripped = AnthropicMessageImageStripper.stripImageBlocks(
-                    objectMapper, body, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
-            return stripped;
-        } catch (Exception e) {
-            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
-                    model, requestId, e.getMessage());
-            return null;
-        }
     }
 
     /** 合并 SSE 心跳：主流结束（或出错/取消）后心跳随之停止。 */
@@ -528,7 +489,7 @@ public class OpenAiProxyService {
                                     requestId, personId, model, mapping.provider(),
                                     Duration.between(start, Instant.now()).toMillis(),
                                     inputTokens.get(), outputTokens.get());
-                            logRequest(personId, mapping, true, null,
+                            support.logRequest(personId, mapping, true, null,
                                     inputTokens.get(), outputTokens.get(), start);
                         }
                         case ON_ERROR -> {
@@ -536,7 +497,7 @@ public class OpenAiProxyService {
                                     requestId, personId, model, mapping.provider(),
                                     Duration.between(start, Instant.now()).toMillis(),
                                     errorRef.get());
-                            logRequest(personId, mapping, false, errorRef.get(),
+                            support.logRequest(personId, mapping, false, errorRef.get(),
                                     inputTokens.get(), outputTokens.get(), start);
                         }
                         case CANCEL -> log.info("OpenAI SSE cancelled: id={} personId={} model={} durationMs={}",
@@ -555,84 +516,6 @@ public class OpenAiProxyService {
                 .header("Cache-Control", "no-cache")
                 .header("Connection", "keep-alive")
                 .body(BodyInserters.fromServerSentEvents(flux));
-    }
-
-    /**
-     * 从请求头提取认证 Token
-     */
-    private String extractAuthToken(ServerRequest request) {
-        String apiKey = request.headers().firstHeader("x-api-key");
-        if (apiKey != null && !apiKey.isBlank()) {
-            return apiKey.trim();
-        }
-        String authorization = request.headers().firstHeader("Authorization");
-        if (authorization == null || authorization.isBlank()) {
-            return null;
-        }
-        String bearerPrefix = "Bearer ";
-        if (authorization.regionMatches(true, 0, bearerPrefix, 0, bearerPrefix.length())) {
-            String token = authorization.substring(bearerPrefix.length()).trim();
-            return token.isBlank() ? null : token;
-        }
-        return null;
-    }
-
-    /**
-     * 从请求 JSON 中提取顶层 model 字段值。
-     * 用 Jackson 精确解析，避免字符串扫描命中 messages/metadata 里嵌套的 model 键。
-     */
-    String extractModel(String body) {
-        try {
-            JsonNode model = objectMapper.readTree(body).get("model");
-            return model != null && model.isTextual() ? model.asText() : null;
-        } catch (Exception e) {
-            log.warn("Failed to extract model from body", e);
-            return null;
-        }
-    }
-
-    /**
-     * 记录请求日志到数据库
-     */
-    private void logRequest(String personId, ProviderConfig mapping, boolean success, String errorMsg,
-                            int inputTokens, int outputTokens, Instant start) {
-        int durationMs = (int) Duration.between(start, Instant.now()).toMillis();
-        requestLogger.log(new RequestLogEntry(personId, mapping.modelName(), mapping.provider(),
-                mapping.upstreamModelId(), success, errorMsg,
-                inputTokens > 0 ? inputTokens : null,
-                outputTokens > 0 ? outputTokens : null,
-                durationMs, Instant.now()));
-    }
-
-    /**
-     * 判断 Anthropic 格式请求体是否含图片 content 块（type=image）。
-     * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。
-     */
-    private boolean hasImageContent(String body) {
-        if (body == null || !body.contains("\"image\"")) {
-            return false;
-        }
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            JsonNode messages = root.path("messages");
-            if (!messages.isArray()) {
-                return false;
-            }
-            for (JsonNode msg : messages) {
-                JsonNode content = msg.path("content");
-                if (!content.isArray()) {
-                    continue;
-                }
-                for (JsonNode block : content) {
-                    if ("image".equals(block.path("type").asText())) {
-                        return true;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            return false;
-        }
-        return false;
     }
 
     /**
@@ -663,21 +546,9 @@ public class OpenAiProxyService {
      * 统一错误处理
      */
     private Mono<ServerResponse> handleError(Throwable e) {
-        Throwable cause = e;
-        while (cause.getCause() != null && cause != cause.getCause()) {
-            cause = cause.getCause();
-        }
-        if (cause instanceof com.padb.ccg.core.exception.UnauthorizedException ue) {
-            return respondOpenAiError(403, "permission_error", ue.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.RateLimitExceededException rle) {
-            return respondOpenAiError(429, "rate_limit_error", rle.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.AuthPlatformUnavailableException apue) {
-            return respondOpenAiError(503, "api_error", apue.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.ProviderException pe) {
-            return respondOpenAiError(502, "api_error", pe.getMessage());
+        ProxyRequestSupport.MappedError mapped = ProxyRequestSupport.mapError(e);
+        if (mapped != null) {
+            return respondOpenAiError(mapped.status(), mapped.type(), mapped.message());
         }
         log.error("Unhandled error in OpenAI proxy", e);
         return respondOpenAiError(500, "internal_error", "Internal gateway error");

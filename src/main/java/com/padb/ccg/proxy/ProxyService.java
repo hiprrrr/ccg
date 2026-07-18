@@ -1,11 +1,6 @@
 package com.padb.ccg.proxy;
 
-import com.padb.ccg.core.model.ProviderConfig;
-import com.padb.ccg.core.model.RequestLogEntry;
-import com.padb.ccg.core.spi.RateLimiter;
-import com.padb.ccg.core.spi.RequestLogger;
 import com.padb.ccg.routing.ProviderRegistryImpl;
-import com.padb.ccg.auth.AuthService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -43,22 +38,17 @@ public class ProxyService {
     private static final Logger log = LoggerFactory.getLogger(ProxyService.class);
     private static final Duration SSE_HEARTBEAT_INTERVAL = Duration.ofSeconds(15);
 
-    private final AuthService authService;
-    private final RateLimiter rateLimiter;
     private final ProviderRegistryImpl providerRegistry;
     private final LlmUpstreamRouter upstreamRouter;
-    private final RequestLogger requestLogger;
+    private final ProxyRequestSupport support;
     private final ObjectMapper objectMapper;
 
-    public ProxyService(AuthService authService, RateLimiter rateLimiter,
-                        ProviderRegistryImpl providerRegistry,
-                        LlmUpstreamRouter upstreamRouter, RequestLogger requestLogger,
+    public ProxyService(ProviderRegistryImpl providerRegistry,
+                        LlmUpstreamRouter upstreamRouter, ProxyRequestSupport support,
                         ObjectMapper objectMapper) {
-        this.authService = authService;
-        this.rateLimiter = rateLimiter;
         this.providerRegistry = providerRegistry;
         this.upstreamRouter = upstreamRouter;
-        this.requestLogger = requestLogger;
+        this.support = support;
         this.objectMapper = objectMapper;
     }
 
@@ -73,7 +63,7 @@ public class ProxyService {
         String requestId = UUID.randomUUID().toString().substring(0, 8);
 
         // 从请求头提取认证 Token：优先兼容 Anthropic 的 x-api-key，回退到 Claude Code 常用的 Bearer token
-        String token = extractAuthToken(request);
+        String token = ProxyRequestSupport.extractAuthToken(request);
         if (token == null || token.isBlank()) {
             return respondError(403, "permission_error", "Missing x-api-key or Authorization Bearer token");
         }
@@ -81,7 +71,7 @@ public class ProxyService {
         return request.bodyToMono(String.class)
                 .flatMap(body -> {
                     // 从请求体提取模型名称
-                    String model = extractModel(body);
+                    String model = support.extractModel(body);
                     if (model == null) {
                         return respondError(400, "invalid_request_error", "Missing model in request body");
                     }
@@ -98,18 +88,10 @@ public class ProxyService {
                     var mapping = mappingOpt.get();
 
                     // 非视觉模型：剥离图片块为占位文本，避免长会话历史中残留 image 导致上游 400
-                    String preparedBody = body;
-                    if (!mapping.supportsVision() && hasImageContent(body)) {
-                        try {
-                            preparedBody = AnthropicMessageImageStripper.stripImageBlocks(
-                                    objectMapper, body, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-                            log.info("Stripped image blocks for non-vision model='{}' id={}", model, requestId);
-                        } catch (Exception e) {
-                            log.warn("Failed to strip image blocks for model='{}' id={}: {}",
-                                    model, requestId, e.getMessage());
-                            return respondError(400, "invalid_request_error",
-                                    "Model '" + model + "' does not support image input");
-                        }
+                    String preparedBody = support.stripImagesIfNonVision(mapping, body, model, requestId);
+                    if (preparedBody == null) {
+                        return respondError(400, "invalid_request_error",
+                                "Model '" + model + "' does not support image input");
                     }
 
                     // 归一化图片块：部分客户端（如 cc-switch）会把 OpenAI 风格的 image_url 块
@@ -122,15 +104,9 @@ public class ProxyService {
                     var errorRef = new AtomicReference<String>(null);
 
                     // 认证 → 限流 → 代理转发
-                    return authService.authorize(token, model)
-                            .flatMap(authResult -> {
-                                String personId = authResult.personId();
+                    return support.authorizeAndRateLimit(token, model)
+                            .flatMap(personId -> {
                                 recordRequestContentPlaceholder(personId, model, body);
-                                return rateLimiter.tryAcquire(personId)
-                                        .thenReturn(personId);
-                            })
-                            .flatMap(ok -> {
-                                String personId = ok;
                                 // 构建 SSE 流，附加错误捕获和日志记录
                                 Flux<ServerSentEvent<String>> bedrockFlux = upstreamRouter
                                         .forward(mapping, normalizedBody, inputTokens, outputTokens, personId, model, requestId);
@@ -156,7 +132,7 @@ public class ProxyService {
                                                             requestId, personId, mapping.provider(), model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
-                                                    logRequest(personId, mapping, true, null,
+                                                    support.logRequest(personId, mapping, true, null,
                                                             inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case ON_ERROR:
@@ -164,7 +140,7 @@ public class ProxyService {
                                                             requestId, personId, mapping.provider(), model,
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             errorRef.get());
-                                                    logRequest(personId, mapping, false, errorRef.get(),
+                                                    support.logRequest(personId, mapping, false, errorRef.get(),
                                                             inputTokens.get(), outputTokens.get(), start);
                                                     break;
                                                 case CANCEL:
@@ -173,7 +149,7 @@ public class ProxyService {
                                                             Duration.between(start, Instant.now()).toMillis(),
                                                             inputTokens.get(), outputTokens.get());
                                                     if (inputTokens.get() > 0 || outputTokens.get() > 0) {
-                                                        logRequest(personId, mapping, false, "client_cancelled",
+                                                        support.logRequest(personId, mapping, false, "client_cancelled",
                                                                 inputTokens.get(), outputTokens.get(), start);
                                                     }
                                                     break;
@@ -191,91 +167,11 @@ public class ProxyService {
     }
 
     /**
-     * 从请求头提取认证 Token。Claude Code 使用 {@code ANTHROPIC_AUTH_TOKEN} 时会发送
-     * {@code Authorization: Bearer <token>}。
-     */
-    private String extractAuthToken(ServerRequest request) {
-        String apiKey = request.headers().firstHeader("x-api-key");
-        if (apiKey != null && !apiKey.isBlank()) {
-            return apiKey.trim();
-        }
-        String authorization = request.headers().firstHeader("Authorization");
-        if (authorization == null || authorization.isBlank()) {
-            return null;
-        }
-        String bearerPrefix = "Bearer ";
-        if (authorization.regionMatches(true, 0, bearerPrefix, 0, bearerPrefix.length())) {
-            String token = authorization.substring(bearerPrefix.length()).trim();
-            return token.isBlank() ? null : token;
-        }
-        return null;
-    }
-
-    /**
-     * 从请求 JSON 中提取顶层 model 字段值。
-     * 用 Jackson 精确解析，避免字符串扫描命中 messages/metadata 里嵌套的 model 键。
-     */
-    String extractModel(String body) {
-        try {
-            JsonNode model = objectMapper.readTree(body).get("model");
-            return model != null && model.isTextual() ? model.asText() : null;
-        } catch (Exception e) {
-            log.warn("Failed to extract model from body", e);
-            return null;
-        }
-    }
-
-    /**
-     * 记录请求日志到数据库（fire-and-forget，不阻塞响应）
-     */
-    private void logRequest(String personId, ProviderConfig mapping, boolean success, String errorMsg,
-                            int inputTokens, int outputTokens, Instant start) {
-        int durationMs = (int) Duration.between(start, Instant.now()).toMillis();
-        requestLogger.log(new RequestLogEntry(personId, mapping.modelName(), mapping.provider(),
-                mapping.upstreamModelId(), success, errorMsg,
-                inputTokens > 0 ? inputTokens : null,
-                outputTokens > 0 ? outputTokens : null,
-                durationMs, Instant.now()));
-    }
-
-    /**
      * 请求内容留存占位：后续如需保存每次请求内容，在这里接入脱敏、截断、加密和 1 个月清理策略。
      * 当前需求明确先不真正落库，避免提前保存可能包含敏感信息的 prompt 或代码内容。
      */
     private void recordRequestContentPlaceholder(String personId, String model, String body) {
         // Intentionally empty.
-    }
-
-    /**
-     * 判断请求体是否含图片 content 块（Anthropic type=image 或 OpenAI type=image_url）。
-     * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。
-     */
-    private boolean hasImageContent(String body) {
-        if (body == null || (!body.contains("\"image\"") && !body.contains("\"image_url\""))) {
-            return false;
-        }
-        try {
-            JsonNode root = objectMapper.readTree(body);
-            JsonNode messages = root.path("messages");
-            if (!messages.isArray()) {
-                return false;
-            }
-            for (JsonNode msg : messages) {
-                JsonNode content = msg.path("content");
-                if (!content.isArray()) {
-                    continue;
-                }
-                for (JsonNode block : content) {
-                    String t = block.path("type").asText();
-                    if ("image".equals(t) || "image_url".equals(t)) {
-                        return true;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            return false;
-        }
-        return false;
     }
 
     /**
@@ -379,22 +275,9 @@ public class ProxyService {
      * 统一错误处理：将异常按类型转换为对应的 HTTP 错误响应
      */
     private Mono<ServerResponse> handleError(Throwable e) {
-        // 解包异常链，获取根因
-        Throwable cause = e;
-        while (cause.getCause() != null && cause != cause.getCause()) {
-            cause = cause.getCause();
-        }
-        if (cause instanceof com.padb.ccg.core.exception.UnauthorizedException ue) {
-            return respondError(403, "permission_error", ue.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.RateLimitExceededException rle) {
-            return respondError(429, "rate_limit_error", rle.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.AuthPlatformUnavailableException apue) {
-            return respondError(503, "api_error", apue.getMessage());
-        }
-        if (cause instanceof com.padb.ccg.core.exception.ProviderException pe) {
-            return respondError(502, "api_error", pe.getMessage());
+        ProxyRequestSupport.MappedError mapped = ProxyRequestSupport.mapError(e);
+        if (mapped != null) {
+            return respondError(mapped.status(), mapped.type(), mapped.message());
         }
         log.error("Unhandled error", e);
         return respondError(500, "api_error", "Internal gateway error");

@@ -9,6 +9,7 @@ import com.padb.ccg.core.spi.RateLimiter;
 import com.padb.ccg.core.spi.RequestLogger;
 import com.padb.ccg.proxy.LlmUpstreamRouter;
 import com.padb.ccg.proxy.OpenAiProxyService;
+import com.padb.ccg.proxy.ProxyRequestSupport;
 import com.padb.ccg.proxy.ProxyService;
 import com.padb.ccg.routing.ProviderRegistryImpl;
 import org.junit.jupiter.api.Test;
@@ -29,7 +30,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 @WebFluxTest
-@Import({GatewayRouter.class, GatewayHandler.class, ProxyService.class})
+@Import({GatewayRouter.class, GatewayHandler.class, ProxyService.class, ProxyRequestSupport.class})
 class ProxyServiceTest {
 
     @Autowired
