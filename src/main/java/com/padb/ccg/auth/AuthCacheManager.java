@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 认证缓存管理器，提供 Token 维度的认证结果缓存以避免重复调用认证平台。
@@ -33,11 +34,22 @@ public class AuthCacheManager {
     private final AuthPlatformClientImpl platformClient;
     private final AuthProperties props;
 
-    /** 进行中的请求映射，key 为认证 Token，value 为异步结果 Future */
-    private final ConcurrentHashMap<String, CompletableFuture<AuthResult>> inflight;
+    /** 进行中的请求映射，key 为认证 Token */
+    private final ConcurrentHashMap<String, Inflight> inflight;
 
     /** Caffeine 变长过期缓存，key 为认证 Token */
     private final Cache<String, AuthResult> cache;
+
+    /**
+     * 共享一次平台调用的 inflight 句柄。
+     * subscribers 记录当前等待该调用的订阅者数量：单个订阅者取消不得影响其他等待者，
+     * 计数归零且调用未完成时才允许从 inflight 中清理，避免「已取消的孤儿调用」永久阻塞后续请求。
+     */
+    private record Inflight(CompletableFuture<AuthResult> future, AtomicInteger subscribers) {
+        static Inflight create() {
+            return new Inflight(new CompletableFuture<>(), new AtomicInteger(1));
+        }
+    }
 
     public AuthCacheManager(AuthPlatformClientImpl platformClient, AuthProperties props) {
         this.platformClient = platformClient;
@@ -100,7 +112,8 @@ public class AuthCacheManager {
 
     /**
      * 获取 Token 的认证结果，缓存可用且包含未过期的请求模型时直接返回，
-     * 否则重新调用认证平台。同一 Token 的并发请求会合并为一次远程调用。
+     * 否则重新调用认证平台。同一 Token 的并发请求共享一次远程调用；
+     * 单个订阅者取消不影响其他等待者，全部取消后才清理 inflight 允许重试。
      */
     public Mono<AuthResult> getAuthorization(String token, String requestedModel) {
         // 一级缓存：Caffeine 变长过期缓存
@@ -109,45 +122,56 @@ public class AuthCacheManager {
             return Mono.just(cached);
         }
 
-        // 二级去重：检查是否已有进行中的请求
-        // 使用 get + putIfAbsent 而非 computeIfAbsent，避免在 subscribe 回调同步触发时递归更新
-        CompletableFuture<AuthResult> inflightCf = inflight.get(token);
-        if (inflightCf != null) {
-            return Mono.fromFuture(inflightCf)
-                    .doOnCancel(() -> inflight.remove(token));
+        // 二级去重：原子地 retain 存活 holder，或创建新 holder 并发起平台调用。
+        // 在 compute 内检查 subscribers>0，避免与 release 的归零清理产生「复活」竞态
+        Inflight[] created = new Inflight[1];
+        Inflight holder = inflight.compute(token, (k, cur) -> {
+            if (cur != null && cur.subscribers().get() > 0) {
+                cur.subscribers().incrementAndGet();
+                return cur;
+            }
+            created[0] = Inflight.create();
+            return created[0];
+        });
+
+        if (created[0] != null) {
+            fetchFromPlatform(token, created[0]);
         }
 
-        CompletableFuture<AuthResult> future = new CompletableFuture<>();
-        inflightCf = inflight.putIfAbsent(token, future);
-        if (inflightCf != null) {
-            // 并发情况下其他线程已创建了 inflight，直接复用
-            return Mono.fromFuture(inflightCf)
-                    .doOnCancel(() -> inflight.remove(token));
-        }
+        // suppressCancel=true：单个订阅者取消不得传播到底层共享 Future
+        return Mono.fromFuture(holder.future(), true)
+                .doOnCancel(() -> release(token, holder));
+    }
 
+    /** 调用认证平台并回填共享 Future；完成或失败时按 holder 身份清理 inflight，避免误删新 holder */
+    private void fetchFromPlatform(String token, Inflight holder) {
         log.info("Fetching authorization from platform for token hash={}", token.hashCode());
         platformClient.fetchAuthorization(token)
                 .subscribe(
                         result -> {
                             // 成功回调：清理 inflight，写入缓存
-                            inflight.remove(token);
+                            inflight.remove(token, holder);
                             cache.put(token, result);
-                            future.complete(result);
+                            holder.future().complete(result);
                         },
                         error -> {
                             // 认证接口失败时拒绝请求，不使用过期缓存降级
                             log.warn("Auth platform error for token hash={}", token.hashCode(), error);
-                            inflight.remove(token);
-                            future.completeExceptionally(
+                            inflight.remove(token, holder);
+                            holder.future().completeExceptionally(
                                     new ProviderException("Unable to verify authorization: auth platform unavailable"));
                         });
+    }
 
-        return Mono.fromFuture(future)
-                .doOnCancel(() -> {
-                    // 客户端取消时清理 inflight 和 Future
-                    inflight.remove(token);
-                    future.cancel(true);
-                });
+    /**
+     * 订阅者取消时递减计数；归零且调用未完成时清理 inflight，使后续请求可以重新发起调用。
+     * 不 cancel 共享 Future：平台调用自然完成后写入缓存，对后续请求反而有利。
+     */
+    private void release(String token, Inflight holder) {
+        if (holder.subscribers().decrementAndGet() <= 0) {
+            inflight.compute(token, (k, cur) ->
+                    cur == holder && cur.subscribers().get() <= 0 ? null : cur);
+        }
     }
 
     /** 判断缓存的认证结果是否仍可用于本次请求模型 */

@@ -47,8 +47,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * 核心流程：
  * 1. 按区域缓存 {@link BedrockRuntimeAsyncClient} 实例（底层 Netty 读超时与 {@code upstream.timeout-seconds} 对齐，避免流式 chunk 间隔过长被默认 ~30s 读超时断开）
  * 2. 构建流式调用请求，通过 Flux.push 桥接 Bedrock 异步回调到 Reactor Flux
- * 3. 在 boundedElastic 调度器上执行阻塞性 AWS SDK 调用
- * 4. 实时提取响应中的 token 用量信息
+ * 3. 实时提取响应中的 token 用量信息
  */
 @Component
 public class BedrockProxyHandler {
@@ -175,18 +174,17 @@ public class BedrockProxyHandler {
                             k -> buildBedrockClientForRegion(k));
 
                     try {
-                        // 去掉 model 字段后，规范化 metadata，避免上游 user_id 等违反 Bedrock 正则导致 400
-                        String stripped = stripModelField(requestBody);
+                        // 规范化请求体：移除 model 字段并重写 metadata，避免上游 user_id 等违反 Bedrock 正则导致 400
                         String bodyForBedrock;
                         try {
                             boolean toolsEnabled = supportsTools(mapping);
                             boolean streamingEnabled = supportsStreaming(mapping);
                             bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
-                                    objectMapper, stripped, username, mapping.upstreamModelId(),
+                                    objectMapper, requestBody, username, mapping.upstreamModelId(),
                                     toolsEnabled, streamingEnabled);
                         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-                            log.warn("Bedrock body metadata normalize failed, using stripped body: {}", e.getMessage());
-                            bodyForBedrock = stripped;
+                            log.warn("Bedrock body metadata normalize failed, using original body: {}", e.getMessage());
+                            bodyForBedrock = requestBody;
                         }
 
                         if (!supportsStreaming(mapping)) {
@@ -519,36 +517,6 @@ public class BedrockProxyHandler {
                 .filter(c -> c != null)
                 .map(c -> c.toLowerCase(Locale.ROOT))
                 .anyMatch(c -> c.equals("stream") || c.equals("streaming"));
-    }
-
-    /**
-     * 从请求体 JSON 中移除 model 字段，避免 Bedrock 因不识别的字段而拒绝请求。
-     * model 已通过 {@code InvokeModelRequest.modelId()} 单独指定。
-     */
-    private String stripModelField(String body) {
-        int idx = body.indexOf("\"model\"");
-        if (idx < 0) return body;
-        // 找到 model 字段值结束的位置
-        int colon = body.indexOf(":", idx);
-        if (colon < 0) return body;
-        int startQuote = body.indexOf("\"", colon + 1);
-        if (startQuote < 0) return body;
-        int endQuote = body.indexOf("\"", startQuote + 1);
-        if (endQuote < 0) return body;
-        // 向前跳过逗号，向后跳过字段结尾的逗号
-        int start = idx;
-        while (start > 0 && (body.charAt(start - 1) == ' ' || body.charAt(start - 1) == '\t')) start--;
-        // 检查 model 后面的逗号，将其一并移除
-        int afterEnd = endQuote + 1;
-        while (afterEnd < body.length() && (body.charAt(afterEnd) == ' ' || body.charAt(afterEnd) == '\t')) afterEnd++;
-        if (afterEnd < body.length() && body.charAt(afterEnd) == ',') {
-            afterEnd++; // 吃掉逗号
-        } else if (start > 0 && body.charAt(start - 1) == ',') {
-            // model 后面没有逗号，但前面有逗号（说明 model 不是第一个字段），清除前面的逗号
-            start--;
-        }
-        while (afterEnd < body.length() && body.charAt(afterEnd) == ' ') afterEnd++;
-        return body.substring(0, start) + body.substring(afterEnd);
     }
 
     /**

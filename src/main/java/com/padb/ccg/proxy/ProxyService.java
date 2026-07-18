@@ -212,19 +212,13 @@ public class ProxyService {
     }
 
     /**
-     * 从请求 JSON 中提取 model 字段值（简单字符串解析，避免完整 JSON 反序列化）
+     * 从请求 JSON 中提取顶层 model 字段值。
+     * 用 Jackson 精确解析，避免字符串扫描命中 messages/metadata 里嵌套的 model 键。
      */
-    private String extractModel(String body) {
+    String extractModel(String body) {
         try {
-            int idx = body.indexOf("\"model\"");
-            if (idx < 0) return null;
-            int colon = body.indexOf(":", idx);
-            if (colon < 0) return null;
-            int startQuote = body.indexOf("\"", colon + 1);
-            if (startQuote < 0) return null;
-            int endQuote = body.indexOf("\"", startQuote + 1);
-            if (endQuote < 0) return null;
-            return body.substring(startQuote + 1, endQuote);
+            JsonNode model = objectMapper.readTree(body).get("model");
+            return model != null && model.isTextual() ? model.asText() : null;
         } catch (Exception e) {
             log.warn("Failed to extract model from body", e);
             return null;

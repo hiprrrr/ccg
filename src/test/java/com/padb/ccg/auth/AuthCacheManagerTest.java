@@ -122,4 +122,25 @@ class AuthCacheManagerTest {
                 .expectNext(fresh)
                 .verifyComplete();
     }
+
+    @Test
+    void shouldNotPoisonSharedFetchWhenOneSubscriberCancels() {
+        var authResult = new AuthResult("person1", Instant.now().plusSeconds(7200),
+                List.of(new ModelAuthorization("claude-opus", Instant.now().plusSeconds(7200))));
+        // 平台调用不立即完成，保证两个订阅者都挂在同一个 inflight 上
+        var pending = reactor.core.publisher.Sinks.<AuthResult>one();
+        when(platformClient.fetchAuthorization("token1")).thenReturn(pending.asMono());
+
+        var first = cacheManager.getAuthorization("token1", "claude-opus");
+        var second = cacheManager.getAuthorization("token1", "claude-opus");
+
+        // 第一个订阅者取消：不得取消共享 Future
+        first.subscribe().dispose();
+
+        // 第二个订阅者仍能拿到平台调用结果
+        var verifier = StepVerifier.create(second).then(() -> pending.tryEmitValue(authResult))
+                .expectNext(authResult).verifyComplete();
+
+        verify(platformClient, times(1)).fetchAuthorization("token1");
+    }
 }

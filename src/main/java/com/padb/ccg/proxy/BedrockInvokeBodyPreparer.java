@@ -38,68 +38,70 @@ public final class BedrockInvokeBodyPreparer {
     }
 
     /**
-     * 解析已去掉 {@code model} 字段的请求体 JSON，规范化 {@code tools} 与根级 {@code metadata}。
+     * 解析请求体 JSON，移除顶层 {@code model} 字段并规范化 {@code tools} 与根级 {@code metadata}。
      *
      * @param mapper              Jackson 映射器
-     * @param jsonWithoutModel    已移除 model 字段的 JSON 文本
+     * @param requestBody         请求体 JSON 文本（顶层 model 字段会在本方法内移除）
      * @param gatewayUsername     网关侧认证用户名（与 x-api-key 一致）
      * @return 可供 Bedrock 接受的请求体 JSON 字符串
      */
-    public static String normalizeMetadata(ObjectMapper mapper, String jsonWithoutModel, String gatewayUsername)
+    public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername)
             throws JsonProcessingException {
-        return normalizeMetadata(mapper, jsonWithoutModel, gatewayUsername, null);
+        return normalizeMetadata(mapper, requestBody, gatewayUsername, null);
     }
 
     /**
-     * 解析已去掉 {@code model} 字段的请求体 JSON，规范化 {@code tools} 与根级 {@code metadata}。
+     * 解析请求体 JSON，移除顶层 {@code model} 字段并规范化 {@code tools} 与根级 {@code metadata}。
      *
      * @param mapper              Jackson 映射器
-     * @param jsonWithoutModel    已移除 model 字段的 JSON 文本
+     * @param requestBody         请求体 JSON 文本（顶层 model 字段会在本方法内移除）
      * @param gatewayUsername     网关侧认证用户名（与 x-api-key 一致）
      * @param bedrockModelId      Bedrock 实际模型 ID，用于处理供应商私有 schema 差异
      * @return 可供 Bedrock 接受的请求体 JSON 字符串
      */
-    public static String normalizeMetadata(ObjectMapper mapper, String jsonWithoutModel, String gatewayUsername,
+    public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId)
             throws JsonProcessingException {
-        return normalizeMetadata(mapper, jsonWithoutModel, gatewayUsername, bedrockModelId, true);
+        return normalizeMetadata(mapper, requestBody, gatewayUsername, bedrockModelId, true);
     }
 
     /**
-     * 解析已去掉 {@code model} 字段的请求体 JSON，规范化 {@code tools} 与根级 {@code metadata}。
+     * 解析请求体 JSON，移除顶层 {@code model} 字段并规范化 {@code tools} 与根级 {@code metadata}。
      *
      * @param mapper              Jackson 映射器
-     * @param jsonWithoutModel    已移除 model 字段的 JSON 文本
+     * @param requestBody         请求体 JSON 文本（顶层 model 字段会在本方法内移除）
      * @param gatewayUsername     网关侧认证用户名（与 x-api-key 一致）
      * @param bedrockModelId      Bedrock 实际模型 ID，用于处理供应商私有 schema 差异
      * @param toolsEnabled        当前模型是否允许工具调用；禁用时会移除工具定义与工具选择
      * @return 可供 Bedrock 接受的请求体 JSON 字符串
      */
-    public static String normalizeMetadata(ObjectMapper mapper, String jsonWithoutModel, String gatewayUsername,
+    public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId, boolean toolsEnabled)
             throws JsonProcessingException {
-        return normalizeMetadata(mapper, jsonWithoutModel, gatewayUsername, bedrockModelId, toolsEnabled, true);
+        return normalizeMetadata(mapper, requestBody, gatewayUsername, bedrockModelId, toolsEnabled, true);
     }
 
     /**
-     * 解析已去掉 {@code model} 字段的请求体 JSON，规范化 {@code tools} 与根级 {@code metadata}。
+     * 解析请求体 JSON，移除顶层 {@code model} 字段并规范化 {@code tools} 与根级 {@code metadata}。
      *
      * @param mapper              Jackson 映射器
-     * @param jsonWithoutModel    已移除 model 字段的 JSON 文本
+     * @param requestBody         请求体 JSON 文本（顶层 model 字段会在本方法内移除）
      * @param gatewayUsername     网关侧认证用户名（与 x-api-key 一致）
      * @param bedrockModelId      Bedrock 实际模型 ID，用于处理供应商私有 schema 差异
      * @param toolsEnabled        当前模型是否允许工具调用；禁用时会移除工具定义与工具选择
      * @param streamingEnabled    当前请求是否走 Bedrock 流式 API；非流式时必须移除 {@code stream}
      * @return 可供 Bedrock 接受的请求体 JSON 字符串
      */
-    public static String normalizeMetadata(ObjectMapper mapper, String jsonWithoutModel, String gatewayUsername,
+    public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId, boolean toolsEnabled, boolean streamingEnabled)
             throws JsonProcessingException {
-        JsonNode root = mapper.readTree(jsonWithoutModel);
+        JsonNode root = mapper.readTree(requestBody);
         if (!root.isObject()) {
-            return jsonWithoutModel;
+            return requestBody;
         }
         ObjectNode obj = (ObjectNode) root;
+        // 移除顶层 model：Bedrock 不接受该字段，模型 ID 通过 InvokeModelRequest.modelId 单独指定
+        obj.remove("model");
         boolean openAiChatShape = usesOpenAiChatShape(bedrockModelId);
         normalizeMessages(obj, openAiChatShape, toolsEnabled);
         if (toolsEnabled) {

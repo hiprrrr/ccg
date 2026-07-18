@@ -119,7 +119,8 @@ public class HttpPassthroughProxyHandler {
                                                                    UpstreamAccountSelector.AccountSelection account) {
         String body;
         try {
-            body = prepareAnthropicRequestBody(requestBody, mapping.upstreamModelId(), streaming);
+            body = prepareAnthropicRequestBody(requestBody, mapping.upstreamModelId(), streaming,
+                    mapping.supportsVision());
         } catch (JsonProcessingException e) {
             return Flux.error(new ProviderException("Invalid request body for provider '"
                     + provider.name() + "': " + e.getMessage()));
@@ -342,11 +343,17 @@ public class HttpPassthroughProxyHandler {
                 });
     }
 
-    private String prepareAnthropicRequestBody(String requestBody, String upstreamModelId, boolean streaming)
+    /**
+     * 替换上游模型 ID 并按视觉能力决定是否剥离图片块：
+     * 仅当模型不支持视觉时才把 image/image_url 块替换为占位文本，
+     * 视觉模型的图片必须原样保留（入口层未剥离时此处不能二次剥离）。
+     */
+    String prepareAnthropicRequestBody(String requestBody, String upstreamModelId, boolean streaming,
+                                       boolean supportsVision)
             throws JsonProcessingException {
-        String stripped = AnthropicMessageImageStripper.stripImageBlocks(
+        String source = supportsVision ? requestBody : AnthropicMessageImageStripper.stripImageBlocks(
                 objectMapper, requestBody, AnthropicMessageImageStripper.DEFAULT_PLACEHOLDER);
-        JsonNode rootNode = objectMapper.readTree(stripped);
+        JsonNode rootNode = objectMapper.readTree(source);
         if (!(rootNode instanceof ObjectNode root)) {
             throw new JsonProcessingException("Request body must be a JSON object") {};
         }
