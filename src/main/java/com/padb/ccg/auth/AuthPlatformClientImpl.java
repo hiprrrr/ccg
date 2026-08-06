@@ -56,7 +56,7 @@ public class AuthPlatformClientImpl implements AuthPlatformClient {
                 .retrieve()
                 // 4xx 客户端错误 → 转为 ProviderException
                 .onStatus(s -> s.is4xxClientError(), response -> {
-                    log.warn("Auth platform returned client error {} for token hash={}", response.statusCode(), token.hashCode());
+                    log.warn("API key authentication failed: {}", token.replaceAll("(?<=.{4}).(?=.{4})", "*"));
                     return Mono.error(new ProviderException(
                             "Auth platform client error: " + response.statusCode()));
                 })
@@ -78,18 +78,18 @@ public class AuthPlatformClientImpl implements AuthPlatformClient {
 
     /**
      * 解析认证平台返回的 JSON 响应，提取个人身份、Token 过期时间和模型授权列表。
-     * 预期格式: {"person_id":"...","token_expire_at":"ISO-8601","models":[{"name":"...","expire_at":"ISO-8601"}]}
+     * 预期格式: {"personId":"...","tokenExpireAtIso":"ISO-8601","models":[{"name":"...","expireAtIso":"ISO-8601"}]}
      */
     @SuppressWarnings("unchecked")
     private AuthResult parseAuthorization(Map<?, ?> body, String token) {
-        String personId = stringValue(body.get("person_id"));
+        String personId = stringValue(body.get("personId"));
         if (personId == null || personId.isBlank()) {
-            throw new ProviderException("Auth platform response missing person_id");
+            throw new ProviderException("Auth platform response missing personId");
         }
 
-        String tokenExpireAtStr = stringValue(body.get("token_expire_at"));
+        String tokenExpireAtStr = stringValue(body.get("tokenExpireAtIso"));
         if (tokenExpireAtStr == null || tokenExpireAtStr.isBlank()) {
-            throw new ProviderException("Auth platform response missing token_expire_at");
+            throw new ProviderException("Auth platform response missing tokenExpireAtIso");
         }
 
         Instant tokenExpireAt;
@@ -110,7 +110,7 @@ public class AuthPlatformClientImpl implements AuthPlatformClient {
                 // 模型名称或有效期缺失时跳过该模型，避免错误放行。
                 .map(m -> {
                     String name = stringValue(m.get("name"));
-                    String expireAtStr = stringValue(m.get("expire_at"));
+                    String expireAtStr = stringValue(m.get("expireAtIso"));
                     if (name == null || name.isBlank() || expireAtStr == null || expireAtStr.isBlank()) {
                         return null;
                     }
