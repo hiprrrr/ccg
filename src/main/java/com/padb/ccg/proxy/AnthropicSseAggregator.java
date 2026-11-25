@@ -34,6 +34,8 @@ public final class AnthropicSseAggregator {
     private String stopReason;
     private String stopSequence;
     private int outputTokens;
+    /** message_delta 携带的输入 token 数（部分上游如 Nova 只在流末才给出真实用量，message_start 里是 0） */
+    private int inputTokens;
 
     public AnthropicSseAggregator(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
@@ -82,6 +84,10 @@ public final class AnthropicSseAggregator {
                 if (event.path("usage").hasNonNull("output_tokens")) {
                     outputTokens = event.path("usage").get("output_tokens").asInt();
                 }
+                // Nova 等上游把真实 input_tokens 放在 message_delta.usage，需要覆盖 message_start 里的 0
+                if (event.path("usage").hasNonNull("input_tokens")) {
+                    inputTokens = event.path("usage").get("input_tokens").asInt();
+                }
             }
             default -> { }
         }
@@ -119,6 +125,9 @@ public final class AnthropicSseAggregator {
             message.put("stop_sequence", stopSequence);
         }
         ObjectNode usage = message.withObject("/usage");
+        if (inputTokens > 0) {
+            usage.put("input_tokens", inputTokens);
+        }
         if (outputTokens > 0) {
             usage.put("output_tokens", outputTokens);
         }

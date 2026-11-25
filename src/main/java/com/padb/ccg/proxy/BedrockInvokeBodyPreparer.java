@@ -791,9 +791,13 @@ public final class BedrockInvokeBodyPreparer {
         }
     }
 
-    /** 目前配置中的 Z.ai 模型 ID 以 zai. 开头，按该前缀启用 GLM 5 工具包装格式。 */
+    /**
+     * 是否为 Z.ai 模型（启用 GLM 的 function 工具包装格式）。
+     * 按厂商段判定并剥离跨区推理前缀，与 {@link BedrockModelFamily} 的家族判定共用同一逻辑，
+     * 避免 {@code us.zai.glm-5} 被判为 OpenAI Chat 家族却不做工具包装的错配。
+     */
     private static boolean isZaiModel(String bedrockModelId) {
-        return bedrockModelId != null && bedrockModelId.startsWith("zai.");
+        return "zai".equals(BedrockModelFamily.vendorOf(bedrockModelId));
     }
 
 /**

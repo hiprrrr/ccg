@@ -210,4 +210,64 @@ class BedrockNovaBodyPreparerTest {
         assertThat(block.has("toolResult")).isFalse();
         assertThat(block.path("text").asText()).contains("file list");
     }
+
+    @Test
+    void mergesConsecutiveSameRoleMessagesAfterDegradation() throws Exception {
+        // 降级跳过 assistant 后，前后两条 user 相邻：Nova 要求角色交替，必须合并
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[
+                   {"role":"user","content":[{"type":"text","text":"run ls"}]},
+                   {"role":"assistant","content":[
+                     {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}
+                   ]},
+                   {"role":"user","content":[
+                     {"type":"tool_result","tool_use_id":"toolu_1","content":"file list"}
+                   ]}
+                 ]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, false));
+
+        assertThat(nova.path("messages").size()).isEqualTo(1);
+        JsonNode merged = nova.path("messages").get(0);
+        assertThat(merged.path("role").asText()).isEqualTo("user");
+        assertThat(merged.path("content").size()).isEqualTo(2);
+        assertThat(merged.path("content").get(0).path("text").asText()).isEqualTo("run ls");
+        assertThat(merged.path("content").get(1).path("text").asText()).contains("file list");
+    }
+
+    @Test
+    void mergesConsecutiveSameRoleMessagesFromAnthropicClients() throws Exception {
+        // Anthropic 允许客户端发连续同角色消息，Nova 要求交替：直接相邻也要合并
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[
+                   {"role":"user","content":[{"type":"text","text":"part 1"}]},
+                   {"role":"user","content":[{"type":"text","text":"part 2"}]}
+                 ]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
+
+        assertThat(nova.path("messages").size()).isEqualTo(1);
+        JsonNode merged = nova.path("messages").get(0);
+        assertThat(merged.path("content").size()).isEqualTo(2);
+        assertThat(merged.path("content").get(0).path("text").asText()).isEqualTo("part 1");
+        assertThat(merged.path("content").get(1).path("text").asText()).isEqualTo("part 2");
+    }
+
+    @Test
+    void keepsAlternatingRolesUntouched() throws Exception {
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[
+                   {"role":"user","content":[{"type":"text","text":"hi"}]},
+                   {"role":"assistant","content":[{"type":"text","text":"hello"}]}
+                 ]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
+
+        assertThat(nova.path("messages").size()).isEqualTo(2);
+        assertThat(nova.path("messages").get(0).path("role").asText()).isEqualTo("user");
+        assertThat(nova.path("messages").get(1).path("role").asText()).isEqualTo("assistant");
+    }
 }

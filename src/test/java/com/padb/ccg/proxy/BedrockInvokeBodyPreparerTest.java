@@ -30,6 +30,20 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
+    void normalizeMetadata_wrapsCustomToolsForZaiGlmWithGeoPrefix() throws Exception {
+        // 跨区推理 ID（us.zai.*）：家族判定剥 geo 前缀，Z.ai 工具包装必须同样剥，两侧判定要同源
+        String in = """
+                {"max_tokens":10,"messages":[{"role":"user","content":"hi"}],
+                 "tools":[{"name":"Read","description":"x",
+                 "input_schema":{"type":"object","properties":{}}}]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "us.zai.glm-5");
+
+        assertThat(out).contains("\"type\":\"function\"");
+        assertThat(out).contains("\"function\":");
+        assertThat(out).contains("\"name\":\"Read\"");
+    }
+
+    @Test
     void normalizeMetadata_addsCustomTypeWhenToolOmitsType() throws Exception {
         String in = """
                 {"max_tokens":10,"messages":[{"role":"user","content":"hi"}],

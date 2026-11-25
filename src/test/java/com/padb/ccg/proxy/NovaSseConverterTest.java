@@ -45,6 +45,8 @@ class NovaSseConverterTest {
         assertThat(message.path("content").get(0).path("text").asText()).isEqualTo("Hello");
         assertThat(message.path("stop_reason").asText()).isEqualTo("end_turn");
         assertThat(message.path("usage").path("output_tokens").asInt()).isEqualTo(7);
+        // Nova 的真实 input_tokens 在流末 message_delta.usage，聚合器应覆盖 message_start 里的 0
+        assertThat(message.path("usage").path("input_tokens").asInt()).isEqualTo(11);
 
         assertThat(converter.getInputTokens()).isEqualTo(11);
         assertThat(converter.getOutputTokens()).isEqualTo(7);

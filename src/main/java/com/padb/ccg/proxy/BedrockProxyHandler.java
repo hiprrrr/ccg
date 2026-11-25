@@ -196,7 +196,7 @@ public class BedrockProxyHandler {
                             if (family == BedrockModelFamily.NOVA) {
                                 // Nova 原生 schema：不接受 model / metadata 等 Anthropic 字段
                                 bodyForBedrock = BedrockNovaBodyPreparer.toNovaBody(objectMapper, requestBody,
-                                        supportsTools(mapping));
+                                        toolsEnabled);
                             } else {
                                 bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
                                         objectMapper, requestBody, username, mapping.upstreamModelId(),
@@ -210,7 +210,7 @@ public class BedrockProxyHandler {
                         if (!supportsStreaming(mapping)) {
                             invokeNonStreaming(client, mapping, bodyForBedrock, username, model,
                                     family, upstreamOpenAiChat, converterRef, emitter, invokeFutureRef,
-                                    streamCompleted, correlationId);
+                                    streamCompleted, inputTokens, outputTokens, correlationId);
                             return;
                         }
 
@@ -375,14 +375,18 @@ public class BedrockProxyHandler {
                 });
     }
 
-    /** 对不稳定或未声明流式能力的模型使用非流式 InvokeModel，并包装为 SSE 返回给上游。 */
-    private void invokeNonStreaming(BedrockRuntimeAsyncClient client, ProviderConfig mapping, String bodyForBedrock,
+    /**
+     * 对不稳定或未声明流式能力的模型使用非流式 InvokeModel，并包装为 SSE 返回给上游。
+     * 包级可见以便单测直接构造调用（验证非流式响应的 token 计账）。
+     */
+    void invokeNonStreaming(BedrockRuntimeAsyncClient client, ProviderConfig mapping, String bodyForBedrock,
                                     String username, String model, BedrockModelFamily family,
                                     boolean upstreamOpenAiChat,
                                     AtomicReference<AnthropicSseConverter> converterRef,
                                     reactor.core.publisher.FluxSink<ServerSentEvent<String>> emitter,
                                     AtomicReference<CompletableFuture<Void>> invokeFutureRef,
                                     AtomicBoolean streamCompleted,
+                                    AtomicInteger inputTokens, AtomicInteger outputTokens,
                                     String traceId) {
         var request = InvokeModelRequest.builder()
                 .modelId(mapping.upstreamModelId())
@@ -396,6 +400,8 @@ public class BedrockProxyHandler {
         CompletableFuture<Void> future = client.invokeModel(request)
                 .thenAccept(response -> {
                     String data = response.body().asUtf8String();
+                    // 非流式响应同样要计账 token 用量（此前漏掉导致请求日志恒为 0）
+                    accumulateUsage(data, inputTokens, outputTokens);
                     try {
                         if (upstreamOpenAiChat) {
                             var converter = converterRef.updateAndGet(
@@ -615,6 +621,9 @@ public class BedrockProxyHandler {
         // Nova 原生 schema 的 usage 字段为驼峰（inputTokens / outputTokens）
         extractIntField(data, "inputTokens").ifPresent(inputTokens::set);
         extractIntField(data, "outputTokens").ifPresent(outputTokens::set);
+        // OpenAI Chat 形态的非流式响应 usage 为 prompt_tokens / completion_tokens
+        extractIntField(data, "prompt_tokens").ifPresent(inputTokens::set);
+        extractIntField(data, "completion_tokens").ifPresent(outputTokens::set);
     }
 
     /**

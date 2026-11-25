@@ -81,4 +81,24 @@ class AnthropicSseAggregatorTest {
         assertThat(message.path("role").asText()).isEqualTo("assistant");
         assertThat(message.withArray("/content")).isEmpty();
     }
+
+    @Test
+    void shouldOverrideInputTokensFromMessageDeltaUsage() {
+        // Nova 等上游 message_start 里 input_tokens 为 0，真实用量在流末 message_delta.usage
+        var aggregator = new AnthropicSseAggregator(mapper);
+
+        aggregator.consume("{\"type\":\"message_start\",\"message\":{\"id\":\"msg_3\",\"role\":\"assistant\","
+                + "\"model\":\"nova-pro\",\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}");
+        aggregator.consume("{\"type\":\"content_block_start\",\"index\":0,"
+                + "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}");
+        aggregator.consume("{\"type\":\"content_block_delta\",\"index\":0,"
+                + "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}");
+        aggregator.consume("{\"type\":\"content_block_stop\",\"index\":0}");
+        aggregator.consume("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\","
+                + "\"stop_sequence\":null},\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}");
+
+        ObjectNode message = aggregator.buildMessage();
+        assertThat(message.at("/usage/input_tokens").asInt()).isEqualTo(11);
+        assertThat(message.at("/usage/output_tokens").asInt()).isEqualTo(7);
+    }
 }

@@ -55,21 +55,41 @@ public enum BedrockModelFamily {
      * @return 协议家族；无法识别时返回 {@link #UNSUPPORTED}
      */
     public static BedrockModelFamily of(String modelId) {
-        if (modelId == null || modelId.isBlank()) {
-            return UNSUPPORTED;
-        }
-        String id = modelId.trim().toLowerCase(Locale.ROOT);
-        // 跨区推理配置：us.amazon.nova-pro-v1:0 → 厂商段为 amazon
-        int dot = id.indexOf('.');
-        if (dot <= 0) {
-            return UNSUPPORTED;
-        }
-        String first = id.substring(0, dot);
-        String vendor = GEO_PREFIXES.contains(first) ? vendorAfterGeo(id) : first;
+        String vendor = vendorOf(modelId);
         if (vendor == null) {
             return UNSUPPORTED;
         }
-        return ofVendor(vendor, id);
+        return ofVendor(vendor, modelId.trim().toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 取模型 ID 的厂商段：先剥离跨区推理配置前缀（{@code us.} / {@code eu.} / {@code global.} 等），
+     * 再取第一个点号分段。家族判定与其他按厂商区分的逻辑（如 Z.ai 工具包装）必须共用本方法，
+     * 避免出现「家族按剥前缀判定、厂商特性按原始前缀判定」的错配。
+     *
+     * @param modelId Bedrock 模型 ID，可为跨区推理配置 ID
+     * @return 小写厂商段（如 {@code amazon} / {@code zai}）；无法解析时返回 null
+     */
+    public static String vendorOf(String modelId) {
+        if (modelId == null || modelId.isBlank()) {
+            return null;
+        }
+        String id = modelId.trim().toLowerCase(Locale.ROOT);
+        int dot = id.indexOf('.');
+        if (dot <= 0) {
+            return null;
+        }
+        String first = id.substring(0, dot);
+        if (!GEO_PREFIXES.contains(first)) {
+            return first;
+        }
+        // 跨区推理配置：us.amazon.nova-pro-v1:0 → 厂商段为 amazon
+        String rest = id.substring(dot + 1);
+        int dot2 = rest.indexOf('.');
+        if (dot2 <= 0) {
+            return null;
+        }
+        return rest.substring(0, dot2);
     }
 
     /**
@@ -89,16 +109,6 @@ public enum BedrockModelFamily {
             case "nova", "amazon-nova" -> NOVA;
             default -> UNSUPPORTED;
         };
-    }
-
-    /** 剥离 geo 前缀后取厂商段；格式不符时返回 null。 */
-    private static String vendorAfterGeo(String id) {
-        String rest = id.substring(id.indexOf('.') + 1);
-        int dot = rest.indexOf('.');
-        if (dot <= 0) {
-            return null;
-        }
-        return rest.substring(0, dot);
     }
 
     /** 厂商段 + 完整模型 ID → 家族。 */

@@ -41,6 +41,9 @@ public final class BedrockNovaBodyPreparer {
     /** 图片为 URL 时的占位文案。 */
     private static final String URL_IMAGE_PLACEHOLDER = "[image omitted: Nova only accepts base64 image bytes]";
 
+    /** toolResult 内图片的占位文案（Nova 的 toolResult 块只接受文本，与 URL 无关）。 */
+    private static final String TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: Nova tool results only accept text]";
+
     /** thinking 块被丢弃时的占位文案。 */
     private static final String THINKING_PLACEHOLDER = "[thinking omitted: Nova does not support thinking blocks]";
 
@@ -81,6 +84,9 @@ public final class BedrockNovaBodyPreparer {
                 appendMessage(mapper, messages, message, toolsEnabled);
             }
         }
+        // Nova 要求 user/assistant 角色交替，而 Anthropic 允许连续同角色
+        // （工具能力关闭降级跳过 assistant 消息后也会产生），转换后统一合并
+        mergeConsecutiveSameRoleMessages(messages);
 
         // inferenceConfig：max_tokens / temperature / top_p / stop_sequences
         ObjectNode inferenceConfig = nova.putObject("inferenceConfig");
@@ -134,6 +140,31 @@ public final class BedrockNovaBodyPreparer {
             }
             ObjectNode novaBlock = system.addObject();
             novaBlock.put("text", text);
+        }
+    }
+
+    /**
+     * 合并相邻同角色消息：把后一条的 content 块并入前一条。
+     * Nova 要求 user/assistant 交替；Anthropic 客户端可能发连续同角色消息，
+     * 或因工具降级跳过 assistant 消息而使两条 user 相邻。
+     */
+    private static void mergeConsecutiveSameRoleMessages(ArrayNode messages) {
+        for (int i = messages.size() - 1; i > 0; i--) {
+            JsonNode current = messages.get(i);
+            JsonNode previous = messages.get(i - 1);
+            if (!current.path("role").asText().equals(previous.path("role").asText())) {
+                continue;
+            }
+            JsonNode previousContent = previous.get("content");
+            JsonNode currentContent = current.get("content");
+            if (previousContent instanceof ArrayNode mergedContent) {
+                if (currentContent instanceof ArrayNode blocks) {
+                    mergedContent.addAll(blocks);
+                } else if (currentContent != null && !currentContent.isNull()) {
+                    mergedContent.add(currentContent);
+                }
+                messages.remove(i);
+            }
         }
     }
 
@@ -292,7 +323,7 @@ public final class BedrockNovaBodyPreparer {
             } else if ("image".equals(type)) {
                 // Nova 的 toolResult 不接受图片块，用占位文本代替
                 ObjectNode placeholder = resultContent.addObject();
-                placeholder.put("text", URL_IMAGE_PLACEHOLDER);
+                placeholder.put("text", TOOL_RESULT_IMAGE_PLACEHOLDER);
             }
         }
     }

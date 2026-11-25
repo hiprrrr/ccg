@@ -52,7 +52,6 @@ class NovaSseConverter {
     private String pendingStopReason;
     private int inputTokens;
     private int outputTokens;
-    private int nextBlockIndex;
     /** 已打开的内容块索引 → 块类型（text / tool_use），用于收尾时补发 content_block_stop。 */
     private final Map<Integer, String> openBlocks = new LinkedHashMap<>();
     /** 已发出 content_block_start 的索引，避免同一块重复发起点事件。 */
@@ -153,7 +152,8 @@ class NovaSseConverter {
 
     /** contentBlockStart：开一个 text 或 tool_use 内容块。 */
     private void appendBlockStart(List<ServerSentEvent<String>> events, JsonNode blockStart) {
-        int index = blockStart.path("contentBlockIndex").asInt(nextBlockIndex);
+        // Nova 的 contentBlockIndex 从 0 递增；缺失时按 0 兜底
+        int index = blockStart.path("contentBlockIndex").asInt(0);
         JsonNode start = blockStart.path("start");
         JsonNode toolUse = start.path("toolUse");
         ObjectNode event = mapper.createObjectNode();
