@@ -14,7 +14,7 @@ import java.util.List;
  * Anthropic SSE 事件流聚合器：把 message_start / content_block_* / message_delta
  * 事件序列还原为完整的 Anthropic message JSON，用于 stream:false 的非流式响应。
  * 上游非流式调用本身也会把完整 message 包装成同样的事件序列（见
- * HttpPassthroughProxyHandler.wrapAnthropicMessageAsSse），因此两种上游路径都能聚合。
+ * AnthropicMessageSseEvents.fromMessage），因此两种上游路径都能聚合。
  */
 public final class AnthropicSseAggregator {
 

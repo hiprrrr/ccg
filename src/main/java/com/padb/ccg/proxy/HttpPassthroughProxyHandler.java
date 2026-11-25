@@ -20,12 +20,10 @@ import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -221,7 +219,8 @@ public class HttpPassthroughProxyHandler {
                                     "Provider '" + provider.name() + "' returned error payload: " + truncateForLog(json)));
                         }
                         accumulateUsageFromAnthropicMessage(json, inputTokens, outputTokens);
-                        List<ServerSentEvent<String>> events = wrapAnthropicMessageAsSse(json, userModel);
+                        List<ServerSentEvent<String>> events =
+                                AnthropicMessageSseEvents.fromMessage(objectMapper, json, userModel);
                         log.info("HTTP passthrough Anthropic non-stream completed: provider={} traceId={} user={} model={} events={}",
                                 provider.name(), traceId, username, userModel, events.size());
                         return Flux.fromIterable(events);
@@ -314,7 +313,8 @@ public class HttpPassthroughProxyHandler {
                         accumulateUsageFromOpenAiMessage(json, inputTokens, outputTokens);
                         String anthropicJson = AnthropicOpenAiRequestConverter.toAnthropicMessage(
                                 objectMapper, json, userModel);
-                        List<ServerSentEvent<String>> events = wrapAnthropicMessageAsSse(anthropicJson, userModel);
+                        List<ServerSentEvent<String>> events =
+                                AnthropicMessageSseEvents.fromMessage(objectMapper, anthropicJson, userModel);
                         log.info("HTTP passthrough OpenAI non-stream→Anthropic SSE: provider={} traceId={} user={} model={} events={}",
                                 provider.name(), traceId, username, userModel, events.size());
                         return Flux.fromIterable(events);
@@ -554,76 +554,6 @@ public class HttpPassthroughProxyHandler {
             // 默认非流式
         }
         return false;
-    }
-
-    /** 将 Anthropic 非流式 Message JSON 包装为 SSE 事件序列。 */
-    private List<ServerSentEvent<String>> wrapAnthropicMessageAsSse(String json, String userModel)
-            throws JsonProcessingException {
-        JsonNode root = objectMapper.readTree(json);
-        List<ServerSentEvent<String>> events = new ArrayList<>();
-
-        String messageId = root.path("id").asText("msg_" + UUID.randomUUID().toString().replace("-", ""));
-        int inputTok = root.path("usage").path("input_tokens").asInt(0);
-        int outputTok = root.path("usage").path("output_tokens").asInt(0);
-
-        ObjectNode messageStart = objectMapper.createObjectNode();
-        messageStart.put("type", "message_start");
-        ObjectNode message = messageStart.putObject("message");
-        message.put("id", messageId);
-        message.put("type", "message");
-        message.put("role", "assistant");
-        message.put("model", userModel);
-        message.putArray("content");
-        ObjectNode usageStart = message.putObject("usage");
-        usageStart.put("input_tokens", inputTok);
-        usageStart.put("output_tokens", 0);
-        events.add(ServerSentEvent.builder(messageStart.toString()).event("message_start").build());
-
-        JsonNode content = root.path("content");
-        int blockIndex = 0;
-        if (content.isArray()) {
-            for (JsonNode block : content) {
-                if ("text".equals(block.path("type").asText("text"))) {
-                    ObjectNode blockStart = objectMapper.createObjectNode();
-                    blockStart.put("type", "content_block_start");
-                    blockStart.put("index", blockIndex);
-                    ObjectNode startBlock = blockStart.putObject("content_block");
-                    startBlock.put("type", "text");
-                    startBlock.put("text", "");
-                    events.add(ServerSentEvent.builder(blockStart.toString()).event("content_block_start").build());
-
-                    String text = block.path("text").asText("");
-                    if (!text.isEmpty()) {
-                        ObjectNode delta = objectMapper.createObjectNode();
-                        delta.put("type", "content_block_delta");
-                        delta.put("index", blockIndex);
-                        ObjectNode deltaBlock = delta.putObject("delta");
-                        deltaBlock.put("type", "text_delta");
-                        deltaBlock.put("text", text);
-                        events.add(ServerSentEvent.builder(delta.toString()).event("content_block_delta").build());
-                    }
-
-                    ObjectNode blockStop = objectMapper.createObjectNode();
-                    blockStop.put("type", "content_block_stop");
-                    blockStop.put("index", blockIndex);
-                    events.add(ServerSentEvent.builder(blockStop.toString()).event("content_block_stop").build());
-                    blockIndex++;
-                }
-            }
-        }
-
-        ObjectNode messageDelta = objectMapper.createObjectNode();
-        messageDelta.put("type", "message_delta");
-        ObjectNode deltaUsage = messageDelta.putObject("usage");
-        deltaUsage.put("output_tokens", outputTok);
-        messageDelta.put("stop_reason", root.path("stop_reason").asText("end_turn"));
-        messageDelta.put("stop_sequence", (String) null);
-        events.add(ServerSentEvent.builder(messageDelta.toString()).event("message_delta").build());
-
-        ObjectNode messageStop = objectMapper.createObjectNode();
-        messageStop.put("type", "message_stop");
-        events.add(ServerSentEvent.builder(messageStop.toString()).event("message_stop").build());
-        return events;
     }
 
     private void accumulateUsageFromAnthropicSse(String data, AtomicInteger inputTokens, AtomicInteger outputTokens) {
