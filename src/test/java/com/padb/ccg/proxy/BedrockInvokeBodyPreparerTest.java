@@ -204,4 +204,92 @@ class BedrockInvokeBodyPreparerTest {
         assertThat(out).contains("\"name\":\"Read\"");
         assertThat(out).contains("\"parameters\":{\"type\":\"object\"");
     }
+
+    @Test
+    void normalizeMetadata_preservesToolResultImagesAsUserMessage() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"a.png"}}]},
+                  {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},
+                    {"type":"text","text":"a.png"}
+                  ]}]}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        var messages = mapper.readTree(out).path("messages");
+        assertThat(messages.get(0).path("role").asText()).isEqualTo("assistant");
+        assertThat(messages.get(1).path("role").asText()).isEqualTo("tool");
+        assertThat(messages.get(1).path("tool_call_id").asText()).isEqualTo("call_1");
+        assertThat(messages.get(1).path("content").asText()).isEqualTo("a.png");
+
+        var imageMsg = messages.get(2);
+        assertThat(imageMsg.path("role").asText()).isEqualTo("user");
+        var imageBlock = imageMsg.path("content").get(0);
+        assertThat(imageBlock.path("type").asText()).isEqualTo("image_url");
+        assertThat(imageBlock.path("image_url").path("url").asText())
+                .isEqualTo("data:image/png;base64,aGk=");
+    }
+
+    @Test
+    void normalizeMetadata_mergesToolResultImagesWithTrailingUserText() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"a.png"}}]},
+                  {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":[
+                      {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
+                    ]},
+                    {"type":"text","text":"What color is it?"}
+                  ]}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        var messages = mapper.readTree(out).path("messages");
+        assertThat(messages.get(1).path("role").asText()).isEqualTo("tool");
+        assertThat(messages.get(1).path("content").asText()).isEqualTo(" ");
+
+        var userMsg = messages.get(2);
+        assertThat(userMsg.path("role").asText()).isEqualTo("user");
+        assertThat(userMsg.path("content").size()).isEqualTo(2);
+        assertThat(userMsg.path("content").get(0).path("text").asText()).isEqualTo("What color is it?");
+        assertThat(userMsg.path("content").get(1).path("type").asText()).isEqualTo("image_url");
+    }
+
+    @Test
+    void normalizeMetadata_parsesStringifiedToolResultContentImages() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"a.png"}}]},
+                  {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1",
+                    "content":"[{\\"type\\":\\"image\\",\\"source\\":{\\"type\\":\\"base64\\",\\"media_type\\":\\"image/png\\",\\"data\\":\\"aGk=\\"}}]"}]}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        var messages = mapper.readTree(out).path("messages");
+        assertThat(messages.get(1).path("role").asText()).isEqualTo("tool");
+        var imageMsg = messages.get(2);
+        assertThat(imageMsg.path("role").asText()).isEqualTo("user");
+        assertThat(imageMsg.path("content").get(0).path("image_url").path("url").asText())
+                .isEqualTo("data:image/png;base64,aGk=");
+    }
+
+    @Test
+    void normalizeMetadata_preservesTopLevelImageInMessageWithToolResult() throws Exception {
+        String in = """
+                {"max_tokens":10,"messages":[
+                  {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"a.png"}}]},
+                  {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"ok"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
+                  ]}
+                ]}""";
+        String out = BedrockInvokeBodyPreparer.normalizeMetadata(mapper, in, "u1", "zai.glm-5");
+
+        var messages = mapper.readTree(out).path("messages");
+        assertThat(messages.get(1).path("role").asText()).isEqualTo("tool");
+        var imageMsg = messages.get(2);
+        assertThat(imageMsg.path("role").asText()).isEqualTo("user");
+        assertThat(imageMsg.path("content").get(0).path("type").asText()).isEqualTo("image_url");
+    }
 }

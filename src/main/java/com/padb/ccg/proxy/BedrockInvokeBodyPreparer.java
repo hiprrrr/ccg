@@ -103,7 +103,7 @@ public final class BedrockInvokeBodyPreparer {
         // 移除顶层 model：Bedrock 不接受该字段，模型 ID 通过 InvokeModelRequest.modelId 单独指定
         obj.remove("model");
         boolean openAiChatShape = usesOpenAiChatShape(bedrockModelId);
-        normalizeMessages(obj, openAiChatShape, toolsEnabled);
+        normalizeMessages(obj, mapper, openAiChatShape, toolsEnabled);
         if (toolsEnabled) {
             normalizeTools(obj, isZaiModel(bedrockModelId));
             if (openAiChatShape) {
@@ -126,7 +126,7 @@ public final class BedrockInvokeBodyPreparer {
      * Z.ai GLM 5 的 Bedrock Runtime 更接近 OpenAI Chat Completions。
      * 将 Claude Code 发来的 Anthropic 内容块转换为字符串、tool_calls 和 tool 消息。
      */
-    private static void normalizeMessages(ObjectNode root, boolean useZaiShape, boolean toolsEnabled) {
+    private static void normalizeMessages(ObjectNode root, ObjectMapper mapper, boolean useZaiShape, boolean toolsEnabled) {
         JsonNode messages = root.get("messages");
         if (!useZaiShape || messages == null || !messages.isArray()) {
             return;
@@ -150,7 +150,7 @@ public final class BedrockInvokeBodyPreparer {
             JsonNode content = message.get("content");
             if (toolsEnabled && "user".equals(role)
                     && content != null && content.isArray() && hasBlockType(content, "tool_result")) {
-                appendUserAndToolResultMessages(root, normalized, content);
+                appendUserAndToolResultMessages(root, mapper, normalized, content);
             } else if (toolsEnabled && "assistant".equals(role)
                     && content != null && content.isArray() && hasBlockType(content, "tool_use")) {
                 appendAssistantToolUseMessage(root, normalized, content);
@@ -207,8 +207,10 @@ public final class BedrockInvokeBodyPreparer {
     }
 
     /** 将包含 tool_result 的 Anthropic user message 拆成 OpenAI user/tool message。 */
-    private static void appendUserAndToolResultMessages(ObjectNode root, ArrayNode normalized, JsonNode content) {
+    private static void appendUserAndToolResultMessages(ObjectNode root, ObjectMapper mapper,
+                                                        ArrayNode normalized, JsonNode content) {
         StringBuilder userText = new StringBuilder();
+        ArrayNode imageBlocks = root.arrayNode();
         for (JsonNode block : content) {
             if (!block.isObject()) {
                 continue;
@@ -216,12 +218,18 @@ public final class BedrockInvokeBodyPreparer {
             String type = block.path("type").asText();
             if ("text".equals(type)) {
                 appendText(userText, block.path("text").asText());
+            } else if ("image".equals(type) || "image_url".equals(type)) {
+                JsonNode imageBlock = toOpenAiImageBlock(root, block);
+                if (imageBlock != null) {
+                    imageBlocks.add(imageBlock);
+                }
             } else if ("tool_result".equals(type)) {
                 String toolCallId = resolveToolCallId(block);
                 String resultText = contentToText(block.get("content"));
                 if (toolCallId.isBlank()) {
                     // 无法关联 assistant.tool_calls 时降级为 user 文本，避免 Bedrock 400
                     appendText(userText, resultText);
+                    collectToolResultImages(root, mapper, block.get("content"), imageBlocks);
                     continue;
                 }
                 if (userText.length() > 0) {
@@ -236,13 +244,63 @@ public final class BedrockInvokeBodyPreparer {
                 toolMsg.put("tool_call_id", toolCallId);
                 toolMsg.put("content", blankContentAsSpace(resultText));
                 normalized.add(toolMsg);
+                collectToolResultImages(root, mapper, block.get("content"), imageBlocks);
             }
         }
-        if (userText.length() > 0) {
+        if (userText.length() > 0 || !imageBlocks.isEmpty()) {
             ObjectNode userMsg = root.objectNode();
             userMsg.put("role", "user");
-            userMsg.put("content", userText.toString());
+            if (imageBlocks.isEmpty()) {
+                userMsg.put("content", userText.toString());
+            } else {
+                ArrayNode blocks = userMsg.putArray("content");
+                if (userText.length() > 0) {
+                    ObjectNode textBlock = root.objectNode();
+                    textBlock.put("type", "text");
+                    textBlock.put("text", userText.toString());
+                    blocks.add(textBlock);
+                }
+                blocks.addAll(imageBlocks);
+            }
             normalized.add(userMsg);
+        }
+    }
+
+    /**
+     * 收集 tool_result.content 中的 image 块并转为 OpenAI image_url 块。
+     * OpenAI tool 角色消息只接受字符串 content，无法携带图片，
+     * 需由随后的 user 消息承载，否则 Bedrock 视觉上游会丢失工具结果中的图片。
+     */
+    private static void collectToolResultImages(ObjectNode root, ObjectMapper mapper,
+                                                 JsonNode toolResultContent, ArrayNode imageBlocks) {
+        JsonNode content = toolResultContent;
+        if (content != null && content.isTextual()) {
+            // 部分客户端会把 content 块数组整体序列化为字符串
+            String text = content.asText();
+            if (!text.contains("\"image\"") && !text.contains("\"image_url\"")) {
+                return;
+            }
+            try {
+                content = mapper.readTree(text);
+            } catch (JsonProcessingException e) {
+                return;
+            }
+        }
+        if (content == null || !content.isArray()) {
+            return;
+        }
+        for (JsonNode block : content) {
+            if (!block.isObject()) {
+                continue;
+            }
+            String type = block.path("type").asText();
+            if (!"image".equals(type) && !"image_url".equals(type)) {
+                continue;
+            }
+            JsonNode imageBlock = toOpenAiImageBlock(root, block);
+            if (imageBlock != null) {
+                imageBlocks.add(imageBlock);
+            }
         }
     }
 
@@ -474,18 +532,8 @@ public final class BedrockInvokeBodyPreparer {
                 textBlock.put("text", block.path("text").asText(""));
                 out.add(textBlock);
             } else if ("image".equals(type)) {
-                JsonNode source = block.path("source");
-                String sourceType = source.path("type").asText();
-                ObjectNode imageBlock = root.objectNode();
-                imageBlock.put("type", "image_url");
-                ObjectNode imageUrl = imageBlock.putObject("image_url");
-                if ("base64".equals(sourceType)) {
-                    String mediaType = source.path("media_type").asText("image/png");
-                    String data = source.path("data").asText("");
-                    imageUrl.put("url", "data:" + mediaType + ";base64," + data);
-                } else if ("url".equals(sourceType)) {
-                    imageUrl.put("url", source.path("url").asText(""));
-                } else {
+                JsonNode imageBlock = toOpenAiImageBlock(root, block);
+                if (imageBlock == null) {
                     // 未知 source 类型：原样透传 image 块，让上游报错暴露问题
                     out.add(block);
                     continue;
@@ -496,6 +544,32 @@ public final class BedrockInvokeBodyPreparer {
             }
         }
         return out;
+    }
+
+    /**
+     * Anthropic image 块 → OpenAI {@code image_url} 块。
+     * 已是 OpenAI 形态的 {@code image_url} 块原样透传；
+     * {@code source} 类型未知时返回 {@code null}，由调用方原样透传以便上游报错暴露问题。
+     */
+    private static JsonNode toOpenAiImageBlock(ObjectNode root, JsonNode block) {
+        if ("image_url".equals(block.path("type").asText())) {
+            return block;
+        }
+        JsonNode source = block.path("source");
+        String sourceType = source.path("type").asText();
+        ObjectNode imageBlock = root.objectNode();
+        imageBlock.put("type", "image_url");
+        ObjectNode imageUrl = imageBlock.putObject("image_url");
+        if ("base64".equals(sourceType)) {
+            String mediaType = source.path("media_type").asText("image/png");
+            String data = source.path("data").asText("");
+            imageUrl.put("url", "data:" + mediaType + ";base64," + data);
+        } else if ("url".equals(sourceType)) {
+            imageUrl.put("url", source.path("url").asText(""));
+        } else {
+            return null;
+        }
+        return imageBlock;
     }
 
     /**
