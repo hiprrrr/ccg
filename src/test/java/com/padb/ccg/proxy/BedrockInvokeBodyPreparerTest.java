@@ -22,6 +22,14 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
+    void detectsOpenAiChatModelFamily() {
+        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("zai.glm-5")).isTrue();
+        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("deepseek.v3.2")).isTrue();
+        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("anthropic.claude-sonnet-4-6")).isFalse();
+        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape(null)).isFalse();
+    }
+
+    @Test
     void normalizeMetadata_addsCustomTypeWhenToolOmitsType() throws Exception {
         String in = """
                 {"max_tokens":10,"messages":[{"role":"user","content":"hi"}],

@@ -75,10 +75,9 @@ bedrock:
   secret-key: ${BEDROCK_SECRET_KEY:${AWS_SECRET_ACCESS_KEY:}}
   # STS 临时凭证（ASIA 开头 access key）必填
   session-token: ${BEDROCK_SESSION_TOKEN:${AWS_SESSION_TOKEN:}}
-  # 响应格式转换策略：
-  # - anthropic: 将 Bedrock 响应转换为 Anthropic API 标准格式（推荐）
-  # - passthrough: 直接透传 Bedrock 原始响应，不做转换
-  response-format: ${BEDROCK_RESPONSE_FORMAT:anthropic}
+  # 请求与响应的协议形态由模型族自动判定（见 model-mappings 的 upstream-model-id）：
+  # - zai.* / deepseek.*: 按 OpenAI Chat Completions 形态收发（请求转 OpenAI 形态，响应由 OpenAI chunk 转 Anthropic SSE）
+  # - 其他（anthropic.claude-* 等）: 按 Anthropic 形态收发（请求保持 Anthropic 形态，响应事件直传）
 
   # ---------------------------------------------------------------------------
   # 工具调用追踪配置（仅用于调试）

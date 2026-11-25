@@ -136,7 +136,6 @@ src/main/java/com/padb/ccg/
 | `upstream.timeout_seconds` | 300 | 上游请求超时（秒），覆盖流式整个生命周期 |
 | `bedrock.region` | `us-east-1` | AWS 默认区域（映射可单独覆盖） |
 | `bedrock.access_key` / `secret_key` / `session_token` | 空 | AWS 凭证；空时走 IRSA / 默认凭证链 |
-| `bedrock.response_format` | `anthropic` | Bedrock 响应转 Anthropic 格式 / `passthrough` 透传 |
 | `bedrock.tool_call_trace_enabled` | false | 工具调用追踪日志（仅调试用） |
 | `auth.platform_url` | （必填） | 认证平台地址 |
 | `auth.platform_timeout_seconds` | 5 | 认证平台超时（秒） |

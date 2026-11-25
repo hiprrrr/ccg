@@ -156,8 +156,9 @@ public class BedrockProxyHandler {
         // 确定使用的 AWS 区域：优先使用映射配置，否则用默认配置
         String region = mapping.region() != null ? mapping.region() : props.region();
 
-        // Anthropic 格式转换器（仅当 response-format=anthropic 时创建，惰性初始化）
-        boolean useAnthropic = "anthropic".equalsIgnoreCase(props.responseFormat());
+        // 上游响应格式由模型族决定：zai./deepseek. 等 OpenAI Chat 形态模型回 OpenAI chunk，
+        // 需要转换成 Anthropic SSE；Anthropic 族模型（anthropic.claude-* 等）回 Anthropic 事件，直接透传。
+        boolean upstreamOpenAiChat = BedrockInvokeBodyPreparer.usesOpenAiChatShape(mapping.upstreamModelId());
         AtomicReference<AnthropicSseConverter> converterRef = new AtomicReference<>();
         AtomicReference<CompletableFuture<Void>> invokeFutureRef = new AtomicReference<>();
         AtomicBoolean streamCompleted = new AtomicBoolean(false);
@@ -189,7 +190,7 @@ public class BedrockProxyHandler {
 
                         if (!supportsStreaming(mapping)) {
                             invokeNonStreaming(client, mapping, bodyForBedrock, username, model,
-                                    useAnthropic, converterRef, emitter, invokeFutureRef, streamCompleted,
+                                    upstreamOpenAiChat, converterRef, emitter, invokeFutureRef, streamCompleted,
                                     correlationId);
                             return;
                         }
@@ -212,7 +213,7 @@ public class BedrockProxyHandler {
                                     int chunkIdx = rawChunkSeq.getAndIncrement();
 
                                     try {
-                                        if (useAnthropic) {
+                                        if (upstreamOpenAiChat) {
                                             var converter = converterRef.updateAndGet(
                                                     c -> c != null ? c : new AnthropicSseConverter(objectMapper, model,
                                                             correlationId, props.toolCallTraceEnabled(),
@@ -225,13 +226,14 @@ public class BedrockProxyHandler {
                                             logToolBedrockChunkIfNeeded(correlationId, chunkIdx, data);
                                             logToolAnthropicUpstreamBatch(correlationId, chunkIdx, batch);
                                         } else {
-                                            emitter.next(ServerSentEvent.<String>builder()
-                                                    .data(data).build());
-                                            if (props.toolCallTraceEnabled() && data.contains("\"tool_calls\"")) {
-                                                toolTrace.info("ToolTrace RAW_BEDROCK_CHUNK traceId={} chunkIdx={} bytes={} preview={}",
-                                                        correlationId, chunkIdx, data.length(),
-                                                        truncateToolLog(data, props.toolCallTraceMaxChars()));
+                                            // 上游已是 Anthropic 事件：按事件类型还原 SSE event 名后直传
+                                            ServerSentEvent<String> event = toAnthropicSseEvent(data);
+                                            if (event != null) {
+                                                emitter.next(event);
+                                                logToolAnthropicUpstreamBatch(correlationId, chunkIdx,
+                                                        List.of(event));
                                             }
+                                            logToolBedrockChunkIfNeeded(correlationId, chunkIdx, data);
                                         }
                                     } catch (Exception e) {
                                         log.error("Failed to emit SSE event for traceId={} user={}", correlationId, username, e);
@@ -273,7 +275,8 @@ public class BedrockProxyHandler {
                                     streamCompleted.set(true);
                                     log.info("Bedrock stream completed for user={} model={}", username, model);
                                     // 部分上游在流末尾不携带 finish_reason，需在关流前补发 Anthropic 结束帧
-                                    if (useAnthropic) {
+                                    // （仅 OpenAI Chat 形态上游需要：Anthropic 族上游自带 message_stop）
+                                    if (upstreamOpenAiChat) {
                                         AnthropicSseConverter c = converterRef.get();
                                         if (c != null) {
                                             try {
@@ -337,7 +340,7 @@ public class BedrockProxyHandler {
 
     /** 对不稳定或未声明流式能力的模型使用非流式 InvokeModel，并包装为 SSE 返回给上游。 */
     private void invokeNonStreaming(BedrockRuntimeAsyncClient client, ProviderConfig mapping, String bodyForBedrock,
-                                    String username, String model, boolean useAnthropic,
+                                    String username, String model, boolean upstreamOpenAiChat,
                                     AtomicReference<AnthropicSseConverter> converterRef,
                                     reactor.core.publisher.FluxSink<ServerSentEvent<String>> emitter,
                                     AtomicReference<CompletableFuture<Void>> invokeFutureRef,
@@ -356,7 +359,7 @@ public class BedrockProxyHandler {
                 .thenAccept(response -> {
                     String data = response.body().asUtf8String();
                     try {
-                        if (useAnthropic) {
+                        if (upstreamOpenAiChat) {
                             var converter = converterRef.updateAndGet(
                                     c -> c != null ? c : new AnthropicSseConverter(objectMapper, model, traceId,
                                             props.toolCallTraceEnabled(), props.toolCallTraceMaxChars()));
@@ -382,10 +385,14 @@ public class BedrockProxyHandler {
                                 }
                             }
                         } else {
-                            emitter.next(ServerSentEvent.<String>builder().data(data).build());
-                            if (props.toolCallTraceEnabled() && data.contains("\"tool_calls\"")) {
-                                toolTrace.info("ToolTrace RAW_NON_STREAM_RESPONSE traceId={} bytes={} preview={}",
-                                        traceId, data.length(), truncateToolLog(data, props.toolCallTraceMaxChars()));
+                            // 上游已是 Anthropic message JSON：展开为 Anthropic SSE 事件序列
+                            for (var event : AnthropicMessageSseEvents.fromMessage(objectMapper, data, model)) {
+                                emitter.next(event);
+                            }
+                            if (props.toolCallTraceEnabled()) {
+                                toolTrace.info("ToolTrace RAW_NON_STREAM_RESPONSE traceId={} user={} bytes={} preview={}",
+                                        traceId, username, data.length(),
+                                        truncateToolLog(data, props.toolCallTraceMaxChars()));
                             }
                         }
                         streamCompleted.set(true);
@@ -404,6 +411,31 @@ public class BedrockProxyHandler {
                 emitter.error(throwable);
             }
         });
+    }
+
+    /**
+     * 将上游返回的 Anthropic 事件 chunk 还原为带 event 名的 Anthropic SSE 事件。
+     * <p>Anthropic 族模型（{@code anthropic.claude-*} 等）在 Bedrock 上直接返回 Anthropic 事件，
+     * 但 SDK 只给出事件体，事件名需按 body 中的 {@code type} 字段还原，
+     * 否则下游 Claude Code 收不到 {@code event: content_block_delta} 而中断。</p>
+     * <p>非事件 chunk（如 {@code amazon-bedrock-invocationMetrics}）返回 {@code null}，不向下游发送。</p>
+     */
+    ServerSentEvent<String> toAnthropicSseEvent(String rawChunk) {
+        if (rawChunk == null || rawChunk.isBlank()) {
+            return null;
+        }
+        final JsonNode root;
+        try {
+            root = objectMapper.readTree(rawChunk);
+        } catch (Exception e) {
+            log.warn("Failed to parse Bedrock chunk as Anthropic event: {}", e.getMessage());
+            return null;
+        }
+        String type = root.path("type").asText("");
+        if (type.isEmpty()) {
+            return null;
+        }
+        return ServerSentEvent.<String>builder().event(type).data(rawChunk).build();
     }
 
     /** 发往 Bedrock 的请求里与工具相关的摘要（不写整包 body）。 */

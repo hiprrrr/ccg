@@ -775,8 +775,16 @@ public final class BedrockInvokeBodyPreparer {
         return bedrockModelId != null && bedrockModelId.startsWith("zai.");
     }
 
-    /** Z.ai 与 DeepSeek Bedrock Runtime 请求均更接近 OpenAI ChatCompletions 结构。 */
-    private static boolean usesOpenAiChatShape(String bedrockModelId) {
+    /**
+     * Z.ai 与 DeepSeek Bedrock Runtime 请求均更接近 OpenAI ChatCompletions 结构。
+     * <p>该判定同时决定上游响应的格式：OpenAI Chat 形态的模型返回 {@code choices[0].delta} 片段，
+     * Anthropic 族模型（{@code anthropic.claude-*} 等）返回 Anthropic SSE 事件。
+     * 请求与响应两侧共用同一判定，避免出现「按 OpenAI 格式发请求、按 Anthropic 格式收响应」的错配。</p>
+     *
+     * @param bedrockModelId Bedrock 模型 ID（model-mappings 的 upstream-model-id）
+     * @return true 表示该模型在 Bedrock 上使用 OpenAI Chat 形态
+     */
+    public static boolean usesOpenAiChatShape(String bedrockModelId) {
         return bedrockModelId != null
                 && (bedrockModelId.startsWith("zai.") || bedrockModelId.startsWith("deepseek."));
     }
