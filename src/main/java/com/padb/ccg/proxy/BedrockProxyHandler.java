@@ -1,5 +1,6 @@
 package com.padb.ccg.proxy;
 
+import com.padb.ccg.core.exception.ProviderException;
 import com.padb.ccg.core.model.ProviderConfig;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
@@ -156,10 +157,22 @@ public class BedrockProxyHandler {
         // 确定使用的 AWS 区域：优先使用映射配置，否则用默认配置
         String region = mapping.region() != null ? mapping.region() : props.region();
 
-        // 上游响应格式由模型族决定：zai./deepseek. 等 OpenAI Chat 形态模型回 OpenAI chunk，
-        // 需要转换成 Anthropic SSE；Anthropic 族模型（anthropic.claude-* 等）回 Anthropic 事件，直接透传。
-        boolean upstreamOpenAiChat = BedrockInvokeBodyPreparer.usesOpenAiChatShape(mapping.upstreamModelId());
+        // 上游协议家族：显式配置优先，否则按 upstream-model-id 推断。
+        // ANTHROPIC → 请求保持 Anthropic 形态、响应为 Anthropic 事件；
+        // OPENAI_CHAT → 请求转 OpenAI Chat 形态、响应为 OpenAI chunk；
+        // NOVA → 请求转 Nova 原生 schema、响应为 Nova 事件。
+        final BedrockModelFamily family = BedrockModelFamily.of(mapping.upstreamModelId(), mapping.upstreamFormat());
+        if (!family.isSupported()) {
+            String supported = String.join("/", BedrockModelFamily.supportedFormatNames());
+            log.warn("Unsupported Bedrock model family: model={} upstreamModelId={} upstreamFormat={}",
+                    model, mapping.upstreamModelId(), mapping.upstreamFormat());
+            return Flux.error(new ProviderException("Bedrock model '" + mapping.upstreamModelId()
+                    + "' belongs to an unsupported protocol family — declare upstream-format ("
+                    + supported + ") in model-mappings to override the automatic detection"));
+        }
+        boolean upstreamOpenAiChat = family == BedrockModelFamily.OPENAI_CHAT;
         AtomicReference<AnthropicSseConverter> converterRef = new AtomicReference<>();
+        AtomicReference<NovaSseConverter> novaConverterRef = new AtomicReference<>();
         AtomicReference<CompletableFuture<Void>> invokeFutureRef = new AtomicReference<>();
         AtomicBoolean streamCompleted = new AtomicBoolean(false);
         /** 与 ProxyService 入口日志共用的关联 ID，便于把 Bedrock 原始 chunk 与一次 HTTP 请求对齐 */
@@ -180,9 +193,14 @@ public class BedrockProxyHandler {
                         try {
                             boolean toolsEnabled = supportsTools(mapping);
                             boolean streamingEnabled = supportsStreaming(mapping);
-                            bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
-                                    objectMapper, requestBody, username, mapping.upstreamModelId(),
-                                    toolsEnabled, streamingEnabled);
+                            if (family == BedrockModelFamily.NOVA) {
+                                // Nova 原生 schema：不接受 model / metadata 等 Anthropic 字段
+                                bodyForBedrock = BedrockNovaBodyPreparer.toNovaBody(objectMapper, requestBody);
+                            } else {
+                                bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
+                                        objectMapper, requestBody, username, mapping.upstreamModelId(),
+                                        toolsEnabled, streamingEnabled, family);
+                            }
                         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
                             log.warn("Bedrock body metadata normalize failed, using original body: {}", e.getMessage());
                             bodyForBedrock = requestBody;
@@ -190,8 +208,8 @@ public class BedrockProxyHandler {
 
                         if (!supportsStreaming(mapping)) {
                             invokeNonStreaming(client, mapping, bodyForBedrock, username, model,
-                                    upstreamOpenAiChat, converterRef, emitter, invokeFutureRef, streamCompleted,
-                                    correlationId);
+                                    family, upstreamOpenAiChat, converterRef, emitter, invokeFutureRef,
+                                    streamCompleted, correlationId);
                             return;
                         }
 
@@ -224,6 +242,16 @@ public class BedrockProxyHandler {
                                                 batch.add(event);
                                             }
                                             logToolBedrockChunkIfNeeded(correlationId, chunkIdx, data);
+                                            logToolAnthropicUpstreamBatch(correlationId, chunkIdx, batch);
+                                        } else if (family == BedrockModelFamily.NOVA) {
+                                            // Nova 事件 → Anthropic SSE
+                                            var converter = novaConverterRef.updateAndGet(
+                                                    c -> c != null ? c : new NovaSseConverter(objectMapper, model));
+                                            List<ServerSentEvent<String>> batch = new ArrayList<>();
+                                            for (var event : converter.convert(data)) {
+                                                emitter.next(event);
+                                                batch.add(event);
+                                            }
                                             logToolAnthropicUpstreamBatch(correlationId, chunkIdx, batch);
                                         } else {
                                             // 上游已是 Anthropic 事件：按事件类型还原 SSE event 名后直传
@@ -297,6 +325,14 @@ public class BedrockProxyHandler {
                                                         tsum.isEmpty() ? "(no_tool_buffer)" : tsum);
                                             }
                                         }
+                                    } else if (family == BedrockModelFamily.NOVA) {
+                                        // Nova 上游可能不发 messageStop，关流前补齐 Anthropic 结束事件
+                                        NovaSseConverter c = novaConverterRef.get();
+                                        if (c != null) {
+                                            for (var event : c.endStreamIfOpen()) {
+                                                emitter.next(event);
+                                            }
+                                        }
                                     }
                                     emitter.complete();
                                 })
@@ -340,7 +376,8 @@ public class BedrockProxyHandler {
 
     /** 对不稳定或未声明流式能力的模型使用非流式 InvokeModel，并包装为 SSE 返回给上游。 */
     private void invokeNonStreaming(BedrockRuntimeAsyncClient client, ProviderConfig mapping, String bodyForBedrock,
-                                    String username, String model, boolean upstreamOpenAiChat,
+                                    String username, String model, BedrockModelFamily family,
+                                    boolean upstreamOpenAiChat,
                                     AtomicReference<AnthropicSseConverter> converterRef,
                                     reactor.core.publisher.FluxSink<ServerSentEvent<String>> emitter,
                                     AtomicReference<CompletableFuture<Void>> invokeFutureRef,
@@ -383,6 +420,17 @@ public class BedrockProxyHandler {
                                                 tsum.isEmpty() ? "(no_tool_buffer)" : tsum);
                                     }
                                 }
+                            }
+                        } else if (family == BedrockModelFamily.NOVA) {
+                            // Nova 非流式响应 → Anthropic message → Anthropic SSE 事件序列
+                            String anthropicJson = NovaSseConverter.toAnthropicMessage(objectMapper, data, model);
+                            for (var event : AnthropicMessageSseEvents.fromMessage(objectMapper, anthropicJson, model)) {
+                                emitter.next(event);
+                            }
+                            if (props.toolCallTraceEnabled()) {
+                                toolTrace.info("ToolTrace RAW_NON_STREAM_RESPONSE traceId={} user={} bytes={} preview={}",
+                                        traceId, username, data.length(),
+                                        truncateToolLog(data, props.toolCallTraceMaxChars()));
                             }
                         } else {
                             // 上游已是 Anthropic message JSON：展开为 Anthropic SSE 事件序列
@@ -563,6 +611,9 @@ public class BedrockProxyHandler {
         // Bedrock 部分模型在流末 chunk 附带 amazon-bedrock-invocationMetrics（驼峰字段）
         extractIntField(data, "inputTokenCount").ifPresent(inputTokens::set);
         extractIntField(data, "outputTokenCount").ifPresent(outputTokens::set);
+        // Nova 原生 schema 的 usage 字段为驼峰（inputTokens / outputTokens）
+        extractIntField(data, "inputTokens").ifPresent(inputTokens::set);
+        extractIntField(data, "outputTokens").ifPresent(outputTokens::set);
     }
 
     /**

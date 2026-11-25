@@ -114,6 +114,14 @@ other-providers:
 
 # ============================================================================
 # 模型映射：model-name 下声明 provider（aws / other-providers 中的 name）及同级的上游参数
+#
+# provider=aws 时的协议家族按 upstream-model-id 自动推断（可跨区 ID，如 us.amazon.nova-pro-v1:0）：
+#   - anthropic.*                                → Anthropic Messages 形态
+#   - zai.* / deepseek.* / qwen.* / moonshotai.* / meta.* / google.* / nvidia.*
+#     / minimax.* / writer.* / openai.* / mistral.* → OpenAI Chat Completions 形态
+#   - amazon.nova-*                              → Amazon Nova 原生形态
+#   - 其他（cohere.* / ai21.* 等）               → 暂不支持，需显式声明 upstream-format 覆盖
+# 推断不准时可用 upstream-format 显式指定：anthropic / openai / nova
 # ============================================================================
 model-mappings:
   - model-name: glm-5

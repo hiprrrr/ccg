@@ -47,11 +47,19 @@ CREATE DATABASE ccg;
 
 ```yaml
 # 模型映射：provider 为 aws 或 other-providers 中的 name
+# provider=aws 时协议家族按 upstream-model-id 自动推断：
+#   anthropic.* → Anthropic 形态；zai./deepseek./qwen./moonshotai./meta./google./nvidia./minimax./writer./openai./mistral.
+#   → OpenAI Chat 形态；amazon.nova-* → Nova 原生形态；推断不准时用 upstream-format 显式指定
 model-mappings:
   - model-name: claude-opus-4-7
     provider: aws
     upstream-model-id: us.anthropic.claude-opus-4-7-v1:0
     region: us-west-2
+    capabilities: [text, vision, tools, stream]
+
+  - model-name: nova-pro
+    provider: aws
+    upstream-model-id: us.amazon.nova-pro-v1:0
     capabilities: [text, vision, tools, stream]
 
 # HTTP 透传供应商（可选，与 Bedrock 平行）
@@ -130,7 +138,7 @@ src/main/java/com/padb/ccg/
 
 | Key | 默认值 | 说明 |
 |-----|--------|------|
-| `model-mappings` | `[]` | 模型映射列表：model-name / provider / upstream-model-id / region / capabilities |
+| `model-mappings` | `[]` | 模型映射列表：model-name / provider / upstream-model-id / region / capabilities / upstream-format |
 | `other-providers` | `[]` | HTTP 透传供应商：name / base-url / api-format / api-keys（多 key 负载） |
 | `upstream.retry_max` | 3 | 上游调用最大重试次数 |
 | `upstream.timeout_seconds` | 300 | 上游请求超时（秒），覆盖流式整个生命周期 |

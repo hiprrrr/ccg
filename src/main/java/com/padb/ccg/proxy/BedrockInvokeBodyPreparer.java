@@ -95,6 +95,26 @@ public final class BedrockInvokeBodyPreparer {
     public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId, boolean toolsEnabled, boolean streamingEnabled)
             throws JsonProcessingException {
+        return normalizeMetadata(mapper, requestBody, gatewayUsername, bedrockModelId, toolsEnabled, streamingEnabled,
+                BedrockModelFamily.of(bedrockModelId));
+    }
+
+    /**
+     * 解析请求体 JSON，移除顶层 {@code model} 字段并规范化 {@code tools} 与根级 {@code metadata}。
+     *
+     * @param mapper              Jackson 映射器
+     * @param requestBody         请求体 JSON 文本（顶层 model 字段会在本方法内移除）
+     * @param gatewayUsername     网关侧认证用户名（与 x-api-key 一致）
+     * @param bedrockModelId      Bedrock 实际模型 ID，用于处理供应商私有 schema 差异
+     * @param toolsEnabled        当前模型是否允许工具调用；禁用时会移除工具定义与工具选择
+     * @param streamingEnabled    当前请求是否走 Bedrock 流式 API；非流式时必须移除 {@code stream}
+     * @param family              上游协议家族，决定请求体是否转换为 OpenAI Chat 形态
+     * @return 可供 Bedrock 接受的请求体 JSON 字符串
+     */
+    public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
+                                           String bedrockModelId, boolean toolsEnabled, boolean streamingEnabled,
+                                           BedrockModelFamily family)
+            throws JsonProcessingException {
         JsonNode root = mapper.readTree(requestBody);
         if (!root.isObject()) {
             return requestBody;
@@ -102,7 +122,8 @@ public final class BedrockInvokeBodyPreparer {
         ObjectNode obj = (ObjectNode) root;
         // 移除顶层 model：Bedrock 不接受该字段，模型 ID 通过 InvokeModelRequest.modelId 单独指定
         obj.remove("model");
-        boolean openAiChatShape = usesOpenAiChatShape(bedrockModelId);
+        boolean openAiChatShape = family == BedrockModelFamily.OPENAI_CHAT;
+
         normalizeMessages(obj, mapper, openAiChatShape, toolsEnabled);
         if (toolsEnabled) {
             normalizeTools(obj, isZaiModel(bedrockModelId));
@@ -775,19 +796,19 @@ public final class BedrockInvokeBodyPreparer {
         return bedrockModelId != null && bedrockModelId.startsWith("zai.");
     }
 
-    /**
+/**
      * Z.ai 与 DeepSeek Bedrock Runtime 请求均更接近 OpenAI ChatCompletions 结构。
      * <p>该判定同时决定上游响应的格式：OpenAI Chat 形态的模型返回 {@code choices[0].delta} 片段，
-     * Anthropic 族模型（{@code anthropic.claude-*} 等）返回 Anthropic SSE 事件。
-     * 请求与响应两侧共用同一判定，避免出现「按 OpenAI 格式发请求、按 Anthropic 格式收响应」的错配。</p>
+ * Anthropic 族模型（{@code anthropic.claude-*} 等）返回 Anthropic SSE 事件。
+ * 请求与响应两侧共用同一判定，避免出现「按 OpenAI 格式发请求、按 Anthropic 格式收响应」的错配。</p>
      *
      * @param bedrockModelId Bedrock 模型 ID（model-mappings 的 upstream-model-id）
      * @return true 表示该模型在 Bedrock 上使用 OpenAI Chat 形态
      */
     public static boolean usesOpenAiChatShape(String bedrockModelId) {
-        return bedrockModelId != null
-                && (bedrockModelId.startsWith("zai.") || bedrockModelId.startsWith("deepseek."));
+        return BedrockModelFamily.of(bedrockModelId) == BedrockModelFamily.OPENAI_CHAT;
     }
+
 
     /**
      * 将用户名压缩为 Bedrock metadata 可接受的 user_id：仅保留字母数字与 {@code ._:-}，超长截断。

@@ -11,9 +11,11 @@ import java.util.List;
  * @param upstreamModelId  上游模型 ID（Bedrock modelId 或 HTTP 透传供应商的 model 参数）
  * @param region           AWS 区域（仅 aws 渠道使用，其他可为 null）
  * @param capabilities     模型能力列表（如 vision、tools、stream 等）
+ * @param upstreamFormat   显式声明的上游协议格式（openai / anthropic / nova），为空时按模型 ID 推断；
+ *                         仅 AWS Bedrock 渠道使用
  */
 public record ProviderConfig(String provider, String modelName, String upstreamModelId,
-                              String region, List<String> capabilities) {
+                              String region, List<String> capabilities, String upstreamFormat) {
     public ProviderConfig {
         if (provider == null || provider.isBlank()) {
             provider = ProviderNames.AWS;
@@ -25,6 +27,15 @@ public record ProviderConfig(String provider, String modelName, String upstreamM
         } else {
             capabilities = List.copyOf(capabilities);
         }
+        if (upstreamFormat != null && upstreamFormat.isBlank()) {
+            upstreamFormat = null;
+        }
+    }
+
+    /** 不显式指定上游格式的构造方式（非 Bedrock 渠道使用）。 */
+    public ProviderConfig(String provider, String modelName, String upstreamModelId,
+                           String region, List<String> capabilities) {
+        this(provider, modelName, upstreamModelId, region, capabilities, null);
     }
 
     /** 是否走 AWS Bedrock */

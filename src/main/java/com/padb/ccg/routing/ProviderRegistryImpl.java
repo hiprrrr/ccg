@@ -2,6 +2,7 @@ package com.padb.ccg.routing;
 
 import com.padb.ccg.core.model.ProviderConfig;
 import com.padb.ccg.core.spi.ProviderRegistry;
+import com.padb.ccg.proxy.BedrockModelFamily;
 import com.padb.ccg.proxy.ModelMappingsProperties;
 import com.padb.ccg.proxy.OtherProvidersRegistry;
 import jakarta.annotation.PostConstruct;
@@ -78,10 +79,20 @@ public class ProviderRegistryImpl implements ProviderRegistry {
     }
 
     /**
-     * 非 aws 的 provider 必须能在 other-providers 中解析到。
+     * 非 aws 的 provider 必须能在 other-providers 中解析到；aws 渠道校验上游协议家族是否受支持。
      */
     private void validateProviderReference(ProviderConfig config) {
         if (config.isAws()) {
+            BedrockModelFamily family = BedrockModelFamily.of(config.upstreamModelId(), config.upstreamFormat());
+            if (!family.isSupported()) {
+                // 不中断启动（避免单条坏映射拖垮整个网关），但请求会在转发前被拒绝
+                log.error("model-mappings model '{}' maps to unsupported Bedrock protocol family: "
+                                + "upstreamModelId='{}' detectedFamily={} upstreamFormat='{}' "
+                                + "(supported formats: {}) — requests to this model will be rejected",
+                        config.modelName(), config.upstreamModelId(), family.displayName(),
+                        config.upstreamFormat(),
+                        String.join("/", BedrockModelFamily.supportedFormatNames()));
+            }
             return;
         }
         if (otherProvidersRegistry.find(config.provider()).isEmpty()) {
