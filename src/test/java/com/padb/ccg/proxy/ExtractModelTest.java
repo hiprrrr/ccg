@@ -30,4 +30,36 @@ class ExtractModelTest {
         assertThat(support.extractModel("{\"model\":123}")).isNull();
         assertThat(support.extractModel("not json")).isNull();
     }
+
+    @Test
+    void detectsImageInsideToolResultContentArray() {
+        String body = """
+                {"model":"m","messages":[{"role":"user","content":[
+                  {"type":"tool_result","tool_use_id":"t1","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
+                  ]}
+                ]}]}
+                """;
+        assertThat(support.hasImageContent(body)).isTrue();
+    }
+
+    @Test
+    void detectsImageInsideStringifiedToolResultContent() {
+        String body = """
+                {"model":"m","messages":[{"role":"user","content":[
+                  {"type":"tool_result","tool_use_id":"t1","content":"[{\\"type\\":\\"image\\",\\"source\\":{\\"type\\":\\"base64\\",\\"data\\":\\"aGk=\\"}}]"}
+                ]}]}
+                """;
+        assertThat(support.hasImageContent(body)).isTrue();
+    }
+
+    @Test
+    void ignoresTextOnlyToolResult() {
+        String body = """
+                {"model":"m","messages":[{"role":"user","content":[
+                  {"type":"tool_result","tool_use_id":"t1","content":"plain text result"}
+                ]}]}
+                """;
+        assertThat(support.hasImageContent(body)).isFalse();
+    }
 }

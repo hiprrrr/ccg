@@ -119,4 +119,100 @@ class AnthropicOpenAiRequestConverterTest {
         assertEquals(1, messages.size());
         assertEquals("real", messages.get(0).path("content").asText());
     }
+
+    @Test
+    void shouldPreserveToolResultImagesAsUserMessage() throws Exception {
+        String anthropic = """
+                {
+                  "model": "glm-5.2",
+                  "max_tokens": 1024,
+                  "messages": [
+                    {"role": "user", "content": "read test.png"},
+                    {"role": "assistant", "content": [
+                      {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "test.png"}}
+                    ]},
+                    {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                        {"type": "text", "text": "test.png"}
+                      ]}
+                    ]}
+                  ]
+                }
+                """;
+
+        String openAi = AnthropicOpenAiRequestConverter.toOpenAiChat(mapper, anthropic, "glm-5.2", true);
+        var messages = mapper.readTree(openAi).path("messages");
+
+        var toolMsg = messages.get(2);
+        assertEquals("tool", toolMsg.path("role").asText());
+        assertEquals("test.png", toolMsg.path("content").asText());
+
+        var imageMsg = messages.get(3);
+        assertEquals("user", imageMsg.path("role").asText());
+        var imageBlock = imageMsg.path("content").get(0);
+        assertEquals("image_url", imageBlock.path("type").asText());
+        assertEquals("data:image/png;base64,aGk=", imageBlock.path("image_url").path("url").asText());
+    }
+
+    @Test
+    void shouldMergeToolResultImagesWithTrailingUserText() throws Exception {
+        String anthropic = """
+                {
+                  "model": "glm-5.2",
+                  "max_tokens": 1024,
+                  "messages": [
+                    {"role": "assistant", "content": [
+                      {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "test.png"}}
+                    ]},
+                    {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+                      ]},
+                      {"type": "text", "text": "What color is it?"}
+                    ]}
+                  ]
+                }
+                """;
+
+        String openAi = AnthropicOpenAiRequestConverter.toOpenAiChat(mapper, anthropic, "glm-5.2", true);
+        var messages = mapper.readTree(openAi).path("messages");
+
+        assertEquals("tool", messages.get(1).path("role").asText());
+        assertEquals(" ", messages.get(1).path("content").asText());
+
+        var userMsg = messages.get(2);
+        assertEquals("user", userMsg.path("role").asText());
+        assertEquals(2, userMsg.path("content").size());
+        assertEquals("What color is it?", userMsg.path("content").get(0).path("text").asText());
+        assertEquals("image_url", userMsg.path("content").get(1).path("type").asText());
+    }
+
+    @Test
+    void shouldParseStringifiedToolResultContentImages() throws Exception {
+        String anthropic = """
+                {
+                  "model": "glm-5.2",
+                  "max_tokens": 1024,
+                  "messages": [
+                    {"role": "assistant", "content": [
+                      {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "test.png"}}
+                    ]},
+                    {"role": "user", "content": [
+                      {"type": "tool_result", "tool_use_id": "call_1",
+                       "content": "[{\\"type\\":\\"image\\",\\"source\\":{\\"type\\":\\"base64\\",\\"media_type\\":\\"image/png\\",\\"data\\":\\"aGk=\\"}}]"}
+                    ]}
+                  ]
+                }
+                """;
+
+        String openAi = AnthropicOpenAiRequestConverter.toOpenAiChat(mapper, anthropic, "glm-5.2", true);
+        var messages = mapper.readTree(openAi).path("messages");
+
+        assertEquals("tool", messages.get(1).path("role").asText());
+        var imageMsg = messages.get(2);
+        assertEquals("user", imageMsg.path("role").asText());
+        assertEquals("data:image/png;base64,aGk=",
+                imageMsg.path("content").get(0).path("image_url").path("url").asText());
+    }
 }

@@ -181,6 +181,7 @@ public final class AnthropicOpenAiRequestConverter {
     /** 将含 tool_result 的 Anthropic user message 拆为 OpenAI user + tool 消息。 */
     private static void appendUserAndToolResultMessages(ObjectMapper mapper, ArrayNode messages, JsonNode content) {
         StringBuilder userText = new StringBuilder();
+        ArrayNode imageBlocks = mapper.createArrayNode();
         for (JsonNode block : content) {
             if (!block.isObject()) {
                 continue;
@@ -188,6 +189,8 @@ public final class AnthropicOpenAiRequestConverter {
             String type = block.path("type").asText();
             if ("text".equals(type)) {
                 appendText(userText, block.path("text").asText());
+            } else if ("image".equals(type)) {
+                imageBlocks.add(convertAnthropicContentBlock(mapper, block));
             } else if ("tool_result".equals(type)) {
                 if (!userText.isEmpty()) {
                     ObjectNode userMsg = messages.addObject();
@@ -200,12 +203,52 @@ public final class AnthropicOpenAiRequestConverter {
                 toolMsg.put("tool_call_id", block.path("tool_use_id").asText());
                 String toolContent = contentToText(block.get("content"));
                 toolMsg.put("content", toolContent.isBlank() ? " " : toolContent);
+                collectToolResultImages(mapper, block.get("content"), imageBlocks);
             }
         }
-        if (!userText.isEmpty()) {
+        if (!userText.isEmpty() || !imageBlocks.isEmpty()) {
             ObjectNode userMsg = messages.addObject();
             userMsg.put("role", "user");
-            userMsg.put("content", userText.toString());
+            if (imageBlocks.isEmpty()) {
+                userMsg.put("content", userText.toString());
+            } else {
+                ArrayNode blocks = userMsg.putArray("content");
+                if (!userText.isEmpty()) {
+                    ObjectNode textBlock = blocks.addObject();
+                    textBlock.put("type", "text");
+                    textBlock.put("text", userText.toString());
+                }
+                blocks.addAll(imageBlocks);
+            }
+        }
+    }
+
+    /**
+     * 收集 tool_result.content 中的 image 块并转为 OpenAI image_url 块。
+     * OpenAI tool 角色消息只接受字符串 content，无法携带图片，
+     * 需由随后的 user 消息承载，否则视觉上游会丢失工具结果中的图片。
+     */
+    private static void collectToolResultImages(ObjectMapper mapper, JsonNode toolResultContent, ArrayNode imageBlocks) {
+        JsonNode content = toolResultContent;
+        if (content != null && content.isTextual()) {
+            // 部分客户端会把 content 块数组整体序列化为字符串
+            String text = content.asText();
+            if (!text.contains("\"image\"") && !text.contains("\"image_url\"")) {
+                return;
+            }
+            try {
+                content = mapper.readTree(text);
+            } catch (JsonProcessingException e) {
+                return;
+            }
+        }
+        if (content == null || !content.isArray()) {
+            return;
+        }
+        for (JsonNode block : content) {
+            if (block.isObject() && "image".equals(block.path("type").asText())) {
+                imageBlocks.add(convertAnthropicContentBlock(mapper, block));
+            }
         }
     }
 

@@ -25,7 +25,8 @@ public final class AnthropicMessageImageStripper {
     public static String stripImageBlocks(ObjectMapper mapper, String requestBody, String placeholderText)
             throws JsonProcessingException {
         if (requestBody == null
-                || (!requestBody.contains("\"image\"") && !requestBody.contains("\"image_url\""))) {
+                || (!requestBody.contains("\"image\"") && !requestBody.contains("\\\"image\\\"")
+                && !requestBody.contains("\"image_url\"") && !requestBody.contains("\\\"image_url\\\""))) {
             return requestBody;
         }
         JsonNode rootNode = mapper.readTree(requestBody);

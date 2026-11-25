@@ -104,7 +104,7 @@ public class ProxyRequestSupport {
      * 先做字符串预检避免每次请求都解析 JSON，命中预检再走 JSON 精确判断。
      */
     public boolean hasImageContent(String body) {
-        if (body == null || (!body.contains("\"image\"") && !body.contains("\"image_url\""))) {
+        if (body == null || !containsImageMarker(body)) {
             return false;
         }
         try {
@@ -123,10 +123,56 @@ public class ProxyRequestSupport {
                     if ("image".equals(t) || "image_url".equals(t)) {
                         return true;
                     }
+                    if ("tool_result".equals(t) && toolResultHasImage(block)) {
+                        return true;
+                    }
                 }
             }
         } catch (Exception e) {
             return false;
+        }
+        return false;
+    }
+
+    /**
+     * 图片块标记预检：匹配 `"image"` / `"image_url"` 的原文与转义形式
+     * （tool_result.content 被整体序列化为字符串时，标记以 `\"image\"` 出现）。
+     */
+    private static boolean containsImageMarker(String body) {
+        return body.contains("\"image\"") || body.contains("\\\"image\\\"")
+                || body.contains("\"image_url\"") || body.contains("\\\"image_url\\\"");
+    }
+
+    /** tool_result.content（块数组或序列化字符串）中是否含图片块。 */
+    private boolean toolResultHasImage(JsonNode toolResult) {
+        JsonNode inner = toolResult.path("content");
+        if (inner.isArray()) {
+            for (JsonNode block : inner) {
+                String t = block.path("type").asText();
+                if ("image".equals(t) || "image_url".equals(t)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (inner.isTextual()) {
+            String text = inner.asText();
+            if (!text.contains("\"image\"") && !text.contains("\"image_url\"")) {
+                return false;
+            }
+            try {
+                JsonNode parsed = objectMapper.readTree(text);
+                if (parsed.isArray()) {
+                    for (JsonNode block : parsed) {
+                        String t = block.path("type").asText();
+                        if ("image".equals(t) || "image_url".equals(t)) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // 非 JSON 字符串按无图片处理
+            }
         }
         return false;
     }
