@@ -195,7 +195,8 @@ public class BedrockProxyHandler {
                             boolean streamingEnabled = supportsStreaming(mapping);
                             if (family == BedrockModelFamily.NOVA) {
                                 // Nova 原生 schema：不接受 model / metadata 等 Anthropic 字段
-                                bodyForBedrock = BedrockNovaBodyPreparer.toNovaBody(objectMapper, requestBody);
+                                bodyForBedrock = BedrockNovaBodyPreparer.toNovaBody(objectMapper, requestBody,
+                                        supportsTools(mapping));
                             } else {
                                 bodyForBedrock = BedrockInvokeBodyPreparer.normalizeMetadata(
                                         objectMapper, requestBody, username, mapping.upstreamModelId(),

@@ -52,25 +52,33 @@ public final class BedrockNovaBodyPreparer {
      *
      * @param mapper       Jackson 映射器
      * @param anthropicBody Anthropic Messages 请求体 JSON
+     * @param mapper       Jackson 映射器
+     * @param anthropicBody Anthropic Messages 请求体 JSON
+     * @param toolsEnabled  模型是否声明了工具能力；false 时不发送 toolConfig，
+     *                      历史中的 tool_use / tool_result 块降级为纯文本
      * @return Nova 请求体 JSON
      */
-    public static String toNovaBody(ObjectMapper mapper, String anthropicBody) throws JsonProcessingException {
+    public static String toNovaBody(ObjectMapper mapper, String anthropicBody, boolean toolsEnabled)
+            throws JsonProcessingException {
         JsonNode root = mapper.readTree(anthropicBody);
         if (!root.isObject()) {
             return anthropicBody;
         }
         ObjectNode nova = mapper.createObjectNode();
 
-        // system：Anthropic 的字符串或块数组 → Nova 的 [{text}]
-        ArrayNode system = nova.putArray("system");
+        // system：Anthropic 的字符串或块数组 → Nova 的 [{text}]；为空时不发送该字段（Nova 中 system 可选）
+        ArrayNode system = mapper.createArrayNode();
         appendSystem(mapper, system, root.get("system"));
+        if (!system.isEmpty()) {
+            nova.set("system", system);
+        }
 
-        // messages：Anthropic messages → Nova messages
+        // messages：Anthropic messages → Nova messages（内容为空的消息跳过，避免 Nova 400）
         ArrayNode messages = nova.putArray("messages");
         JsonNode anthropicMessages = root.get("messages");
         if (anthropicMessages != null && anthropicMessages.isArray()) {
             for (JsonNode message : anthropicMessages) {
-                appendMessage(mapper, messages, message);
+                appendMessage(mapper, messages, message, toolsEnabled);
             }
         }
 
@@ -89,8 +97,10 @@ public final class BedrockNovaBodyPreparer {
             stopSequences.forEach(s -> stops.add(s.asText()));
         }
 
-        // toolConfig：tools + tool_choice
-        appendToolConfig(mapper, nova, root);
+        // toolConfig：tools + tool_choice（模型未声明工具能力时不发送）
+        if (toolsEnabled) {
+            appendToolConfig(mapper, nova, root);
+        }
         return mapper.writeValueAsString(nova);
     }
 
@@ -127,8 +137,8 @@ public final class BedrockNovaBodyPreparer {
         }
     }
 
-    /** 单条 Anthropic message → Nova message。 */
-    private static void appendMessage(ObjectMapper mapper, ArrayNode messages, JsonNode message) {
+    /** 单条 Anthropic message → Nova message；内容为空时跳过（Nova 不接受空 content）。 */
+    private static void appendMessage(ObjectMapper mapper, ArrayNode messages, JsonNode message, boolean toolsEnabled) {
         if (!message.isObject()) {
             return;
         }
@@ -139,7 +149,6 @@ public final class BedrockNovaBodyPreparer {
         ArrayNode novaContent = novaMessage.putArray("content");
 
         if (content == null || content.isNull()) {
-            messages.add(novaMessage);
             return;
         }
         if (content.isTextual()) {
@@ -149,17 +158,21 @@ public final class BedrockNovaBodyPreparer {
             return;
         }
         if (!content.isArray()) {
-            messages.add(novaMessage);
             return;
         }
         for (JsonNode block : content) {
-            appendContentBlock(mapper, novaContent, block);
+            appendContentBlock(mapper, novaContent, block, toolsEnabled);
+        }
+        // 工具能力关闭时 tool_use 块被丢弃，可能出现全部内容块都被丢弃的空消息
+        if (novaContent.isEmpty()) {
+            return;
         }
         messages.add(novaMessage);
     }
 
     /** 单个 Anthropic content block → Nova content block。 */
-    private static void appendContentBlock(ObjectMapper mapper, ArrayNode novaContent, JsonNode block) {
+    private static void appendContentBlock(ObjectMapper mapper, ArrayNode novaContent, JsonNode block,
+                                           boolean toolsEnabled) {
         if (!block.isObject()) {
             return;
         }
@@ -171,6 +184,10 @@ public final class BedrockNovaBodyPreparer {
             }
             case "image" -> appendImage(mapper, novaContent, block);
             case "tool_use" -> {
+                if (!toolsEnabled) {
+                    // 模型不支持工具：丢弃 tool_use 块，与 OpenAI 转换路径的降级行为一致
+                    return;
+                }
                 ObjectNode toolUse = novaContent.addObject().putObject("toolUse");
                 toolUse.put("toolUseId", block.path("id").asText(""));
                 toolUse.put("name", block.path("name").asText(""));
@@ -181,7 +198,7 @@ public final class BedrockNovaBodyPreparer {
                     toolUse.putObject("input");
                 }
             }
-            case "tool_result" -> appendToolResult(mapper, novaContent, block);
+            case "tool_result" -> appendToolResult(mapper, novaContent, block, toolsEnabled);
             case "thinking" -> {
                 ObjectNode placeholder = novaContent.addObject();
                 placeholder.put("text", THINKING_PLACEHOLDER);
@@ -212,13 +229,43 @@ public final class BedrockNovaBodyPreparer {
         bytes.put("bytes", source.path("data").asText(""));
     }
 
-    /** Anthropic tool_result 块 → Nova toolResult 块。 */
-    private static void appendToolResult(ObjectMapper mapper, ArrayNode novaContent, JsonNode block) {
+    /** Anthropic tool_result 块 → Nova toolResult 块；模型不支持工具时降级为纯文本。 */
+    private static void appendToolResult(ObjectMapper mapper, ArrayNode novaContent, JsonNode block,
+                                          boolean toolsEnabled) {
+        if (!toolsEnabled) {
+            // 模型不支持工具：把工具结果拍平成文本，保留对话上下文
+            ObjectNode textBlock = novaContent.addObject();
+            textBlock.put("text", toolResultAsText(block));
+            return;
+        }
         ObjectNode toolResult = novaContent.addObject().putObject("toolResult");
         toolResult.put("toolUseId", block.path("tool_use_id").asText(""));
         ArrayNode resultContent = toolResult.putArray("content");
         appendToolResultContent(mapper, resultContent, block.get("content"));
-        toolResult.put("status", "success");
+        // Anthropic 的 is_error=true 对应 Nova 的 status=error
+        boolean isError = block.path("is_error").asBoolean(false);
+        toolResult.put("status", isError ? "error" : "success");
+    }
+
+    /** 工具能力关闭时 tool_result 的降级文案。 */
+    private static String toolResultAsText(JsonNode block) {
+        StringBuilder sb = new StringBuilder("[tool result");
+        String id = block.path("tool_use_id").asText("");
+        if (!id.isBlank()) {
+            sb.append(" ").append(id);
+        }
+        sb.append("] ");
+        JsonNode content = block.get("content");
+        if (content != null && content.isTextual()) {
+            sb.append(content.asText());
+        } else if (content != null && content.isArray()) {
+            for (JsonNode inner : content) {
+                if (inner.isObject() && "text".equals(inner.path("type").asText())) {
+                    sb.append(inner.path("text").asText(""));
+                }
+            }
+        }
+        return sb.toString();
     }
 
     /** tool_result 的内容（字符串或块数组）→ Nova toolResult.content 文本块。 */

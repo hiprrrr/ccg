@@ -18,7 +18,7 @@ class BedrockNovaBodyPreparerTest {
                  "system":"You are helpful",
                  "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         assertThat(nova.path("system").get(0).path("text").asText()).isEqualTo("You are helpful");
         assertThat(nova.path("messages").get(0).path("role").asText()).isEqualTo("user");
@@ -43,7 +43,7 @@ class BedrockNovaBodyPreparerTest {
                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
                  ]}]}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         JsonNode imageBlock = nova.path("messages").get(0).path("content").get(1).path("image");
         assertThat(imageBlock.path("format").asText()).isEqualTo("png");
@@ -58,7 +58,7 @@ class BedrockNovaBodyPreparerTest {
                    {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}
                  ]}]}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         JsonNode block = nova.path("messages").get(0).path("content").get(0);
         assertThat(block.has("image")).isFalse();
@@ -80,7 +80,7 @@ class BedrockNovaBodyPreparerTest {
                    ]}
                  ]}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         JsonNode toolUse = nova.path("messages").get(0).path("content").get(0).path("toolUse");
         assertThat(toolUse.path("toolUseId").asText()).isEqualTo("toolu_1");
@@ -102,7 +102,7 @@ class BedrockNovaBodyPreparerTest {
                            "input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
                  "tool_choice":{"type":"auto"}}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         JsonNode toolSpec = nova.path("toolConfig").path("tools").get(0).path("toolSpec");
         assertThat(toolSpec.path("name").asText()).isEqualTo("Read");
@@ -119,7 +119,7 @@ class BedrockNovaBodyPreparerTest {
                  "tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}}],
                  "tool_choice":{"type":"none"}}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         assertThat(nova.has("toolConfig")).isFalse();
     }
@@ -132,7 +132,7 @@ class BedrockNovaBodyPreparerTest {
                  "tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}}],
                  "tool_choice":{"type":"tool","name":"Read"}}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         assertThat(nova.path("toolConfig").path("toolChoice").path("tool").path("name").asText()).isEqualTo("Read");
     }
@@ -146,10 +146,68 @@ class BedrockNovaBodyPreparerTest {
                    {"type":"text","text":"answer"}
                  ]}]}
                 """;
-        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic));
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
 
         JsonNode blocks = nova.path("messages").get(0).path("content");
         assertThat(blocks.get(0).path("text").asText()).contains("thinking omitted");
         assertThat(blocks.get(1).path("text").asText()).isEqualTo("answer");
+    }
+
+    @Test
+    void omitsSystemFieldWhenAbsent() throws Exception {
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[{"role":"user","content":"hi"}]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
+
+        assertThat(nova.has("system")).isFalse();
+    }
+
+    @Test
+    void mapsToolResultErrorStatus() throws Exception {
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[
+                   {"role":"assistant","content":[
+                     {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}
+                   ]},
+                   {"role":"user","content":[
+                     {"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"boom"}
+                   ]}
+                 ]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, true));
+
+        JsonNode toolResult = nova.path("messages").get(1).path("content").get(0).path("toolResult");
+        assertThat(toolResult.path("status").asText()).isEqualTo("error");
+        assertThat(toolResult.path("content").get(0).path("text").asText()).isEqualTo("boom");
+    }
+
+    @Test
+    void dropsToolConfigAndDegradesToolBlocksWhenToolsDisabled() throws Exception {
+        String anthropic = """
+                {"model":"m","max_tokens":100,
+                 "messages":[
+                   {"role":"assistant","content":[
+                     {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"ls"}}
+                   ]},
+                   {"role":"user","content":[
+                     {"type":"tool_result","tool_use_id":"toolu_1","content":"file list"}
+                   ]}
+                 ],
+                 "tools":[{"name":"Bash","input_schema":{"type":"object","properties":{}}}]}
+                """;
+        JsonNode nova = mapper.readTree(BedrockNovaBodyPreparer.toNovaBody(mapper, anthropic, false));
+
+        // 未声明工具能力：不下发 toolConfig
+        assertThat(nova.has("toolConfig")).isFalse();
+        // tool_use 块被丢弃，只含 tool_use 的 assistant 消息整条跳过
+        assertThat(nova.path("messages").size()).isEqualTo(1);
+        assertThat(nova.path("messages").get(0).path("role").asText()).isEqualTo("user");
+        // tool_result 降级为纯文本
+        JsonNode block = nova.path("messages").get(0).path("content").get(0);
+        assertThat(block.has("toolResult")).isFalse();
+        assertThat(block.path("text").asText()).contains("file list");
     }
 }
