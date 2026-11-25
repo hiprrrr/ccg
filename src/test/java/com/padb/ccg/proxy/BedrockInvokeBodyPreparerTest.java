@@ -22,14 +22,6 @@ class BedrockInvokeBodyPreparerTest {
     }
 
     @Test
-    void detectsOpenAiChatModelFamily() {
-        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("zai.glm-5")).isTrue();
-        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("deepseek.v3.2")).isTrue();
-        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape("anthropic.claude-sonnet-4-6")).isFalse();
-        assertThat(BedrockInvokeBodyPreparer.usesOpenAiChatShape(null)).isFalse();
-    }
-
-    @Test
     void normalizeMetadata_wrapsCustomToolsForZaiGlmWithGeoPrefix() throws Exception {
         // 跨区推理 ID（us.zai.*）：家族判定剥 geo 前缀，Z.ai 工具包装必须同样剥，两侧判定要同源
         String in = """
@@ -290,6 +282,9 @@ class BedrockInvokeBodyPreparerTest {
 
         var messages = mapper.readTree(out).path("messages");
         assertThat(messages.get(1).path("role").asText()).isEqualTo("tool");
+        // 字符串化 content 解析后只取 text 块：tool 消息文本不能混入 base64（图片由 user 消息承载）
+        assertThat(messages.get(1).path("content").asText()).isEqualTo(" ");
+        assertThat(messages.get(1).path("content").asText()).doesNotContain("aGk=");
         var imageMsg = messages.get(2);
         assertThat(imageMsg.path("role").asText()).isEqualTo("user");
         assertThat(imageMsg.path("content").get(0).path("image_url").path("url").asText())

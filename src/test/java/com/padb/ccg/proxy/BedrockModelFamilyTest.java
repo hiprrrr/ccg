@@ -49,7 +49,14 @@ class BedrockModelFamilyTest {
         assertThat(BedrockModelFamily.of("us.xai.grok-4.7")).isEqualTo(BedrockModelFamily.UNSUPPORTED);
         assertThat(BedrockModelFamily.of("amazon.titan-text-express-v1:0")).isEqualTo(BedrockModelFamily.UNSUPPORTED);
         assertThat(BedrockModelFamily.of(null)).isEqualTo(BedrockModelFamily.UNSUPPORTED);
-        assertThat(BedrockModelFamily.of("no-dot")).isEqualTo(BedrockModelFamily.UNSUPPORTED);
+        assertThat(BedrockModelFamily.of(" ")).isEqualTo(BedrockModelFamily.UNSUPPORTED);
+    }
+
+    @Test
+    void fallsBackToAnthropicForDotlessIds() {
+        // 无点号 ID（如 Bedrock 导入模型的自定义命名）：回退 Anthropic 透传，与基线行为一致
+        assertThat(BedrockModelFamily.of("my-imported-model")).isEqualTo(BedrockModelFamily.ANTHROPIC);
+        assertThat(BedrockModelFamily.of("weird-model-name")).isEqualTo(BedrockModelFamily.ANTHROPIC);
     }
 
     @Test

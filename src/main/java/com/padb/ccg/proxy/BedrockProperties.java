@@ -7,7 +7,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * 超时与重试见第一层级 {@link UpstreamProperties}（{@code upstream.*}）。
  *
  * <p>上游请求与响应的协议形态由模型族决定（见
- * {@link BedrockInvokeBodyPreparer#usesOpenAiChatShape(String)}），不再由配置项控制。</p>
+ * {@link BedrockModelFamily#of(String)}），不再由配置项控制。</p>
  *
  * @param region             默认 AWS 区域
  * @param accessKey          AWS 访问密钥

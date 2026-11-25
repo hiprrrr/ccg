@@ -78,7 +78,9 @@ public final class BedrockInvokeBodyPreparer {
     public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId, boolean toolsEnabled)
             throws JsonProcessingException {
-        return normalizeMetadata(mapper, requestBody, gatewayUsername, bedrockModelId, toolsEnabled, true);
+        // 直连带 family 的重载：不经已废弃的 6 参版本，避免内部产生废弃告警
+        return normalizeMetadata(mapper, requestBody, gatewayUsername, bedrockModelId, toolsEnabled, true,
+                BedrockModelFamily.of(bedrockModelId));
     }
 
     /**
@@ -91,7 +93,10 @@ public final class BedrockInvokeBodyPreparer {
      * @param toolsEnabled        当前模型是否允许工具调用；禁用时会移除工具定义与工具选择
      * @param streamingEnabled    当前请求是否走 Bedrock 流式 API；非流式时必须移除 {@code stream}
      * @return 可供 Bedrock 接受的请求体 JSON 字符串
+     * @deprecated 本重载按模型 ID 推断家族、忽略 {@code model-mappings} 的 {@code upstream-format} 显式覆盖，
+     *             与网关实际分派逻辑（BedrockProxyHandler）不同源；请改用带 {@link BedrockModelFamily} 的重载
      */
+    @Deprecated
     public static String normalizeMetadata(ObjectMapper mapper, String requestBody, String gatewayUsername,
                                            String bedrockModelId, boolean toolsEnabled, boolean streamingEnabled)
             throws JsonProcessingException {
@@ -246,7 +251,7 @@ public final class BedrockInvokeBodyPreparer {
                 }
             } else if ("tool_result".equals(type)) {
                 String toolCallId = resolveToolCallId(block);
-                String resultText = contentToText(block.get("content"));
+                String resultText = toolResultContentText(mapper, block.get("content"));
                 if (toolCallId.isBlank()) {
                     // 无法关联 assistant.tool_calls 时降级为 user 文本，避免 Bedrock 400
                     appendText(userText, resultText);
@@ -493,6 +498,25 @@ public final class BedrockInvokeBodyPreparer {
     }
 
     /** 将 Anthropic 字符串/内容块数组压缩为普通文本。 */
+    /**
+     * tool_result.content 的文本化：字符串化的块数组解析成功后只取 text 块。
+     * 直接把原始 JSON 串当 tool 消息文本会让 base64 图片数据同时进入
+     * tool 消息与后续 user 消息的 image_url 块，导致 prompt 体积翻倍。
+     */
+    private static String toolResultContentText(ObjectMapper mapper, JsonNode content) {
+        if (content != null && content.isTextual()) {
+            try {
+                JsonNode parsed = mapper.readTree(content.asText());
+                if (parsed.isArray()) {
+                    return contentToText(parsed);
+                }
+            } catch (JsonProcessingException ignored) {
+                // 非 JSON 字符串按原文处理
+            }
+        }
+        return contentToText(content);
+    }
+
     private static String contentToText(JsonNode content) {
         if (content == null || content.isNull()) {
             return "";
@@ -799,20 +823,6 @@ public final class BedrockInvokeBodyPreparer {
     private static boolean isZaiModel(String bedrockModelId) {
         return "zai".equals(BedrockModelFamily.vendorOf(bedrockModelId));
     }
-
-/**
-     * Z.ai 与 DeepSeek Bedrock Runtime 请求均更接近 OpenAI ChatCompletions 结构。
-     * <p>该判定同时决定上游响应的格式：OpenAI Chat 形态的模型返回 {@code choices[0].delta} 片段，
- * Anthropic 族模型（{@code anthropic.claude-*} 等）返回 Anthropic SSE 事件。
- * 请求与响应两侧共用同一判定，避免出现「按 OpenAI 格式发请求、按 Anthropic 格式收响应」的错配。</p>
-     *
-     * @param bedrockModelId Bedrock 模型 ID（model-mappings 的 upstream-model-id）
-     * @return true 表示该模型在 Bedrock 上使用 OpenAI Chat 形态
-     */
-    public static boolean usesOpenAiChatShape(String bedrockModelId) {
-        return BedrockModelFamily.of(bedrockModelId) == BedrockModelFamily.OPENAI_CHAT;
-    }
-
 
     /**
      * 将用户名压缩为 Bedrock metadata 可接受的 user_id：仅保留字母数字与 {@code ._:-}，超长截断。

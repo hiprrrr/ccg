@@ -57,7 +57,12 @@ public enum BedrockModelFamily {
     public static BedrockModelFamily of(String modelId) {
         String vendor = vendorOf(modelId);
         if (vendor == null) {
-            return UNSUPPORTED;
+            if (modelId == null || modelId.isBlank()) {
+                return UNSUPPORTED;
+            }
+            // 无点号 ID（如 Bedrock 导入模型的自定义命名）无法判定厂商：
+            // 回退 Anthropic 透传，与家族判定引入前的基线行为一致；可用 upstream-format 显式覆盖
+            return ANTHROPIC;
         }
         return ofVendor(vendor, modelId.trim().toLowerCase(Locale.ROOT));
     }

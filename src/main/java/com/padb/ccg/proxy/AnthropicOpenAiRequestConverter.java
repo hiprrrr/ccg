@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.util.List;
+
 /**
  * Anthropic Messages 请求体与 OpenAI Chat Completions 请求体互转（供华为 MaaS OpenAI 上游使用）。
  */
@@ -192,6 +194,14 @@ public final class AnthropicOpenAiRequestConverter {
             } else if ("image".equals(type)) {
                 imageBlocks.add(convertAnthropicContentBlock(mapper, block));
             } else if ("tool_result".equals(type)) {
+                String toolCallId = resolveToolCallId(block);
+                String toolContent = toolResultContentText(mapper, block.get("content"));
+                if (toolCallId.isBlank()) {
+                    // 无法关联 assistant.tool_calls 时降级为 user 文本，避免产出空 tool_call_id 被 OpenAI 上游拒绝
+                    appendText(userText, toolContent);
+                    collectToolResultImages(mapper, block.get("content"), imageBlocks);
+                    continue;
+                }
                 if (!userText.isEmpty()) {
                     ObjectNode userMsg = messages.addObject();
                     userMsg.put("role", "user");
@@ -200,8 +210,7 @@ public final class AnthropicOpenAiRequestConverter {
                 }
                 ObjectNode toolMsg = messages.addObject();
                 toolMsg.put("role", "tool");
-                toolMsg.put("tool_call_id", block.path("tool_use_id").asText());
-                String toolContent = contentToText(block.get("content"));
+                toolMsg.put("tool_call_id", toolCallId);
                 toolMsg.put("content", toolContent.isBlank() ? " " : toolContent);
                 collectToolResultImages(mapper, block.get("content"), imageBlocks);
             }
@@ -250,6 +259,40 @@ public final class AnthropicOpenAiRequestConverter {
                 imageBlocks.add(convertAnthropicContentBlock(mapper, block));
             }
         }
+    }
+
+    /**
+     * 从 Anthropic {@code tool_result} 块解析 OpenAI {@code tool_call_id}。
+     * 依次尝试 {@code tool_use_id}、{@code tool_call_id}、{@code id}，兼容不同客户端字段命名；
+     * 与 Bedrock 转换路径的解析规则保持一致。
+     */
+    private static String resolveToolCallId(JsonNode toolResultBlock) {
+        for (String field : List.of("tool_use_id", "tool_call_id", "id")) {
+            String value = toolResultBlock.path(field).asText("");
+            if (!value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    /**
+     * tool_result.content 的文本化：字符串化的块数组解析成功后只取 text 块。
+     * 直接把原始 JSON 串当 tool 消息文本会让 base64 图片数据同时出现在
+     * tool 消息与后续 user 消息的 image_url 块里，导致 prompt 体积翻倍。
+     */
+    private static String toolResultContentText(ObjectMapper mapper, JsonNode content) {
+        if (content != null && content.isTextual()) {
+            try {
+                JsonNode parsed = mapper.readTree(content.asText());
+                if (parsed.isArray()) {
+                    return contentToText(parsed);
+                }
+            } catch (JsonProcessingException ignored) {
+                // 非 JSON 字符串按原文处理
+            }
+        }
+        return contentToText(content);
     }
 
     /** 将含 tool_use 的 Anthropic assistant message 转为 OpenAI assistant.tool_calls。 */
